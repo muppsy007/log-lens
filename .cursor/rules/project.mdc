@@ -1,0 +1,67 @@
+---
+description: Global project rules for log-lens
+globs: ["**/*.rs", "**/*.toml", "**/*.html", "**/*.md"]
+alwaysApply: true
+---
+
+# log-lens Project Rules
+
+## Project Purpose
+AI-powered log file analyser. Rust for parsing/aggregation/serving.
+Anthropic API for analysis. Web UI for charts and interactive Q&A.
+
+## Non-Negotiable Architecture Rules
+
+### The AnalysisEngine Trait
+The AI layer MUST be accessed only through the `AnalysisEngine` trait defined in `src/ai/mod.rs`.
+Never reference `AnthropicEngine` directly outside of `src/ai/`.
+This boundary exists so the AI layer can be replaced with a Python microservice without
+touching any other code.
+
+```rust
+// CORRECT — depend on the trait
+async fn handle_analysis(engine: &dyn AnalysisEngine, summary: &LogSummary) { ... }
+
+// WRONG — never do this outside src/ai/
+let engine = AnthropicEngine::new(api_key);
+```
+
+### Log Summary — Never Raw Lines
+The LLM receives a `LogSummary` struct (aggregated stats), never raw log content.
+This keeps token usage low and is a deliberate design decision. Do not change this.
+
+### Typed Domain Model
+All parsed log lines become `LogRecord` enum variants. No HashMaps, no String fields
+where structured types are possible.
+
+### Error Handling
+Use `anyhow::Result` throughout library code. No `.unwrap()` or `.expect()` except
+in tests or truly unrecoverable startup situations.
+
+### Async Runtime
+Tokio only. Do not introduce a second async runtime.
+
+### API Key
+Always read from `std::env::var("ANTHROPIC_API_KEY")`. Never hardcode.
+
+## Parser Architecture
+Parsers implement the `Parser` trait from `src/parser/mod.rs`.
+Format detection is automatic from file content sampling.
+AI-inferred parsing (`src/parser/ai_infer.rs`) is the fallback only — check built-ins first.
+Inferred schemas are cached to avoid repeated API calls.
+
+## Current Model
+Use `claude-sonnet-4-20250514` for all Anthropic API calls.
+Max tokens: 1024 for analysis, 512 for chat responses.
+Always include the aggregated summary as context in chat turns.
+
+## File Ownership
+- `src/parser/` — parsing only, no AI calls except ai_infer.rs
+- `src/aggregator.rs` — pure computation, no I/O
+- `src/summary.rs` — serialisation only
+- `src/ai/` — all LLM interaction
+- `src/server.rs` — HTTP only, delegates to ai/ and aggregator
+- `frontend/index.html` — single file, no build step required
+
+## Samples
+`samples/` contains synthetic log data only. Never commit real log files.

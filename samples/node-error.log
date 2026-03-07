@@ -1,0 +1,10 @@
+2026-03-07T09:00:01.123Z  INFO  Server started on port 3000
+2026-03-07T09:05:44.221Z  INFO  GET /api/users 200 42ms
+2026-03-07T09:08:12.774Z  INFO  POST /api/login 200 88ms user=alice@example.com
+2026-03-07T09:10:05.339Z  WARN  Rate limit threshold approaching: IP 203.0.113.42 (87/100 req/min)
+2026-03-07T09:11:09.002Z  ERROR DB query failed: connection timeout after 5000ms [query: SELECT * FROM orders]
+2026-03-07T09:11:09.004Z  ERROR GET /api/orders 500 5012ms — unhandled exception: DatabaseConnectionError
+2026-03-07T09:12:30.887Z  WARN  JWT token expired for user id=4821, redirecting to login
+2026-03-07T09:14:55.561Z  ERROR POST /api/checkout 422 12ms — validation failed: missing required field "shipping_address"
+2026-03-07T09:18:03.114Z  INFO  GET /api/products 200 31ms
+2026-03-07T09:20:17.990Z  ERROR Unhandled promise rejection: TypeError: Cannot read properties of undefined (reading 'price') at CartService.js:88
