@@ -98,6 +98,8 @@ log-lens/
 - **Use `anyhow::Result` for error propagation** throughout — no `.unwrap()` in library code.
 - **Tokio** is the async runtime — do not introduce a second runtime.
 - The `AnalysisEngine` trait must remain the only interface the server and CLI use for AI.
+- **Every parser module must have a `#[cfg(test)]` block** with at least one valid-input test and one malformed-input test using lines from `samples/`
+- **No `.unwrap()` in library code** — tests are the one exception
 
 ## Environment Variables
 
