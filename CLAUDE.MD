@@ -49,11 +49,16 @@ Always depend on the `AnalysisEngine` trait.**
 
 Tiered approach — do not collapse these tiers:
 
-1. **Built-in parsers** (no API call): Apache, Nginx, JSON, Syslog
-1. **AI-inferred parsing** (fallback): Send 20 sample lines to LLM, receive schema,
-   cache schema locally, apply to remaining lines
+| Tier | Trigger | Behaviour |
+|------|---------|-----------|
+| 1 | Known format flag (`--format apache`) | Built-in parser used directly. No API call. |
+| 2 | Auto-detect match | Sample first 5 lines, match against built-in parser heuristics. No API call. |
+| 3 | No match (fallback) | Send 20 sample lines to LLM. Receive schema. Cache to disk. Apply to file. |
 
-Format detection is automatic. Users can override with `--format` flag.
+Built-in formats: Apache, Nginx, JSON, Syslog.
+
+**Tier 2 must run before Tier 3.** The heuristic check is cheap; the API call is not.
+The cached schema means the API is called once per novel format, not once per run.
 
 ## Project Structure
 
@@ -135,16 +140,31 @@ tower-http = { version = "0.5", features = ["fs", "cors"] }
 
 ## Build Order (for agents starting from scratch)
 
-1. `parser/mod.rs` — Parser trait and LogRecord type
-1. `parser/apache.rs` — First concrete parser
-1. `aggregator.rs` — Stats from a Vec<LogRecord>
-1. `summary.rs` — LogSummary serialisation
-1. `ai/mod.rs` — AnalysisEngine trait
-1. `ai/anthropic.rs` — Anthropic API implementation
-1. `main.rs` — Wire together in report mode
-1. `parser/ai_infer.rs` — AI-inferred format fallback
-1. `server.rs` — Axum server + endpoints
-1. `frontend/index.html` — Web UI
+Build one step at a time. Verify each step before proceeding to the next.
+
+| # | File | Done When |
+|---|------|-----------|
+| 1 | `parser/mod.rs` | Parser trait compiles. `LogRecord` enum has at least an Apache variant. |
+| 2 | `parser/apache.rs` | Single Apache log line parses to `LogRecord` without panic. |
+| 3 | `aggregator.rs` | `Vec<LogRecord>` produces `LogSummary` with error rate and status code counts. |
+| 4 | `summary.rs` | `LogSummary` serialises to JSON correctly. |
+| 5 | `ai/mod.rs` | `AnalysisEngine` trait compiles. No implementation yet. |
+| 6 | `ai/mock.rs` | `MockEngine` returns canned `AnalysisResult`. Tests pass. |
+| 7 | `ai/anthropic.rs` | `AnthropicEngine` calls API, returns real analysis. Tested with sample file. |
+| 8 | `main.rs` | `cargo run -- --file samples/apache-access.log` prints plain-English summary. |
+| 9 | `parser/ai_infer.rs` | Unknown-format file parsed correctly. Schema cached to disk. |
+| 10 | `server.rs` | `GET /api/summary` and `POST /api/chat` return valid JSON. |
+| 11 | `frontend/index.html` | Browser shows charts and chat interface at `localhost:3000`. |
+
+## Verification
+
+Run after every step before moving on:
+```bash
+cargo test
+cargo run -- --file samples/apache-access.log
+```
+
+Step 8 onwards: confirm no panic and output is human-readable.
 
 ## Future Evolution (inform architectural decisions now)
 
