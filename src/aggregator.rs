@@ -21,7 +21,7 @@ pub struct SuspiciousIp {
 /// The statistical summary produced from a batch of parsed log records.
 /// Kept as a plain data struct (not an iterator/stream) so it can be serialised
 /// to JSON, stored, or handed to the AI layer without further transformation.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSummary {
     /// Total number of records in the batch.
     pub total: u64,

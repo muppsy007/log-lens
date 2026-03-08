@@ -185,6 +185,43 @@
       margin-bottom: 12px;
     }
 
+    /* ── History bar ────────────────────────────────────────────────────── */
+    /*
+      Hidden by default; JS shows it once there is at least one stored result.
+      `display: none` → `display: flex` is toggled via JS (not a class) so the
+      bar disappears entirely when the results list is empty.
+    */
+    .history-bar {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    .history-bar label {
+      font-size: 0.85rem;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .history-bar select {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 6px 10px;
+      color: var(--text);
+      font-size: 0.9rem;
+      cursor: pointer;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    .history-bar select:focus { border-color: var(--accent); }
+
     /* ── Issue triage cards ─────────────────────────────────────────────── */
     .issue-card {
       border-left: 4px solid;
@@ -298,6 +335,19 @@
 
   <main>
 
+    <!-- ── Previous analyses dropdown ─────────────────────────────────── -->
+    <!--
+      Hidden until JS confirms at least one stored result exists.
+      Selecting an entry loads it from GET /api/results/:id without re-running
+      the full analysis pipeline.
+    -->
+    <div class="history-bar" id="history-bar">
+      <label for="history-select">Previous analyses</label>
+      <select id="history-select">
+        <option value="">— select a past result —</option>
+      </select>
+    </div>
+
     <!-- ── Log file path input ─────────────────────────────────────────── -->
     <!--
       A text field (not a file picker) because the server reads the path
@@ -364,6 +414,82 @@
     */
     let chart = null;
 
+    /* ── History dropdown ─────────────────────────────────────────────── */
+
+    /*
+      Fetches the stored result list and rebuilds the <select> options.
+      If autoSelectId is provided, the matching option is selected after rebuild.
+      If the list is empty the history bar is hidden entirely.
+      Errors are swallowed — history is non-critical and must never block the UI.
+    */
+    async function loadHistory(autoSelectId = null) {
+      try {
+        const res = await fetch('/api/results');
+        if (!res.ok) return;
+        const results = await res.json();
+
+        const bar = document.getElementById('history-bar');
+        const sel = document.getElementById('history-select');
+
+        if (results.length === 0) {
+          bar.style.display = 'none';
+          return;
+        }
+
+        bar.style.display = 'flex';
+
+        // Remember the previously-selected value so re-populating the list
+        // does not silently lose the user's current selection.
+        const prevValue = autoSelectId != null ? String(autoSelectId) : sel.value;
+
+        sel.innerHTML = '<option value="">— select a past result —</option>';
+
+        for (const r of results) {
+          const dt = new Date(r.analysed_at);
+          const label =
+            `${r.filename} — ${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}`;
+          const opt = document.createElement('option');
+          opt.value = String(r.id);
+          opt.textContent = label;
+          sel.appendChild(opt);
+        }
+
+        // Restore (or set) the desired selection.
+        if (prevValue) sel.value = prevValue;
+      } catch (_) {
+        // Silently ignore — history is non-critical.
+      }
+    }
+
+    // When the user picks a past result, fetch its detail and render it.
+    document.getElementById('history-select')
+      .addEventListener('change', async function () {
+        const id = this.value;
+        if (!id) return;
+
+        setLoading(true);
+        clearError();
+        hideResults();
+
+        try {
+          const res = await fetch(`/api/results/${id}`);
+          if (!res.ok) {
+            const msg = await res.text();
+            throw new Error(`Could not load result ${id}: ${msg}`);
+          }
+          // StoredResultDetail has { summary, analysis } — same shape as the
+          // fresh-analysis response, so render() reuses without modification.
+          render(await res.json());
+        } catch (err) {
+          showError(err.message);
+        } finally {
+          setLoading(false);
+        }
+      });
+
+    // Populate the dropdown as soon as the page loads.
+    loadHistory();
+
     /* ── Main action ──────────────────────────────────────────────────── */
 
     async function analyse() {
@@ -395,6 +521,13 @@
 
         const data = await res.json();
         render(data);
+
+        // Refresh the history dropdown and auto-select the newest entry.
+        // Because the list is ordered newest-first, the first non-placeholder
+        // option is always the result we just saved.
+        await loadHistory();
+        const sel = document.getElementById('history-select');
+        if (sel.options.length > 1) sel.value = sel.options[1].value;
 
       } catch (err) {
         showError(err.message);
