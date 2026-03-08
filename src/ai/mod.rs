@@ -1,3 +1,5 @@
+pub mod mock;
+
 use anyhow::Result;
 use serde::Serialize;
 
