@@ -4,3 +4,7 @@
 
 /target
 /docs/log-lens-spec.docx
+
+log_lens.db
+log_lens.db-shm
+log_lens.db-wal
