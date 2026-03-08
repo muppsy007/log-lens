@@ -2,6 +2,7 @@ mod aggregator;
 mod ai;
 mod parser;
 pub mod server;
+mod store;
 mod summary;
 
 use std::fs::File;
