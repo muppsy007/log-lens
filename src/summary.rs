@@ -38,6 +38,7 @@ mod tests {
             status_counts,
             top_errors: vec![],
             top_slow_paths: vec![],
+            suspicious_ips: vec![],
         };
 
         let json = to_json(&summary).expect("serialisation must succeed");
