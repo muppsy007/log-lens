@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // Pull in the types we aggregate over. `crate::` is used (rather than `super::`)
 // because aggregator is a top-level module; it has no parent module to `super::` into.
@@ -9,7 +9,7 @@ use crate::parser::LogRecord;
 /// The statistical summary produced from a batch of parsed log records.
 /// Kept as a plain data struct (not an iterator/stream) so it can be serialised
 /// to JSON, stored, or handed to the AI layer without further transformation.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LogSummary {
     /// Total number of records in the batch.
     pub total: u64,

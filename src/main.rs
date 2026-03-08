@@ -1,14 +1,15 @@
 mod aggregator;
 mod ai;
 mod parser;
+pub mod server;
 mod summary;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use anyhow::{Context, Result};
-// The derive macro is re-exported as `clap::Parser`; aliasing it here avoids
-// a name collision with our own `parser::Parser` trait in the same scope.
+// The derive macro is re-exported as `clap::Parser`; aliasing it avoids a
+// name collision with our own `parser::Parser` trait in the same scope.
 use clap::Parser as ClapParser;
 use colored::Colorize;
 
@@ -20,45 +21,95 @@ use parser::apache::ApacheParser;
 use parser::Parser;
 use summary::to_json;
 
-/// CLI configuration. `clap` derives argument parsing from this struct,
-/// turning field names into `--flag` names automatically.
+/// CLI configuration. Clap derives argument parsing from the struct fields.
 #[derive(ClapParser)]
 #[command(name = "log-lens", about = "Analyse log files using an LLM")]
 struct Cli {
-    /// Path to the log file to analyse.
+    /// Path to the log file to analyse (required in analysis mode).
     #[arg(long)]
-    file: String,
+    file: Option<String>,
+
+    /// Start the Axum HTTP server instead of running a one-shot analysis.
+    /// The log file is then supplied as a query parameter: ?file=path/to/log
+    #[arg(long, default_value_t = false)]
+    serve: bool,
 }
 
-// `#[tokio::main]` rewrites `main` into a synchronous entry point that
-// bootstraps the Tokio runtime and then drives the async body to completion.
-// Without this macro, `.await` would not be usable in `main`.
+// `#[tokio::main]` rewrites `main` into a sync entry point that bootstraps
+// the Tokio runtime and drives the async body to completion.
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.serve {
+        return run_server().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Analysis mode — --file is required when not in server mode
+    // -----------------------------------------------------------------------
+    let file_path = cli
+        .file
+        .ok_or_else(|| anyhow::anyhow!("--file is required in analysis mode (or use --serve)"))?;
+
+    run_analysis(&file_path).await
+}
+
+// ---------------------------------------------------------------------------
+// Server mode
+// ---------------------------------------------------------------------------
+
+async fn run_server() -> Result<()> {
+    let engine: Box<dyn AnalysisEngine> = match AnthropicEngine::new() {
+        Ok(e) => Box::new(e),
+        Err(_) => {
+            eprintln!(
+                "{}",
+                "Error: ANTHROPIC_API_KEY is not set.\n\
+                 Export it and try again:\n\
+                 \n  export ANTHROPIC_API_KEY=sk-ant-..."
+                    .red()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Read host/port from environment variables with sensible defaults.
+    // Using env vars (rather than CLI flags) matches the twelve-factor app
+    // convention and makes the server easy to configure in containers.
+    let host =
+        std::env::var("LOG_LENS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("LOG_LENS_PORT")
+        .ok()
+        // `and_then` chains on Some; `unwrap_or` provides the default.
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+
+    server::start_server(engine, &host, port).await
+}
+
+// ---------------------------------------------------------------------------
+// Analysis mode (one-shot CLI)
+// ---------------------------------------------------------------------------
+
+async fn run_analysis(file_path: &str) -> Result<()> {
     // -----------------------------------------------------------------------
     // 1. Read file into memory
     // -----------------------------------------------------------------------
 
-    let file = File::open(&cli.file)
-        // `.with_context()` attaches the file path to any IO error so the
-        // user sees "Could not open file: foo.log" instead of a bare OS error.
-        .with_context(|| format!("Could not open file: {}", cli.file))?;
+    let file = File::open(file_path)
+        .with_context(|| format!("Could not open file: {file_path}"))?;
 
-    // Collect all lines upfront so we can sample them for format detection
-    // before choosing a parser, without reading the file twice.
-    // `BufReader` buffers the read to avoid per-byte OS syscalls.
+    // Collect all lines so we can sample for format detection before choosing
+    // a parser without reading the file twice.
     let lines: Vec<String> = BufReader::new(file)
         .lines()
-        // `collect::<io::Result<Vec<_>>>()` short-circuits on the first IO error.
         .collect::<std::io::Result<Vec<_>>>()?;
 
     // -----------------------------------------------------------------------
     // 2. Format detection (Tier 2 → Tier 3)
     // -----------------------------------------------------------------------
 
-    // Sample up to 20 non-empty lines for detection.
     let sample: Vec<&str> = lines
         .iter()
         .filter(|l| !l.trim().is_empty())
@@ -71,8 +122,6 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Tier 2: heuristic check — try Apache parser on the first 5 sample lines.
-    // Five lines is enough to rule out coincidental partial matches on a header.
     let apache_parser = ApacheParser::new()?;
     let tier2_sample = &sample[..sample.len().min(5)];
     let apache_hits = tier2_sample
@@ -80,21 +129,19 @@ async fn main() -> Result<()> {
         .filter(|l| apache_parser.parse(l).is_ok())
         .count();
 
-    // Use Apache if the majority of the sample matches; otherwise fall through
-    // to Tier 3. The `* 2 >= len` trick avoids floating-point division.
     let parser: Box<dyn Parser> = if apache_hits * 2 >= tier2_sample.len() {
         println!("{}", "Detected format: Apache Combined Log".dimmed());
         Box::new(apache_parser)
     } else {
-        // Tier 3: send up to 20 sample lines to the LLM to infer a regex.
-        // The result is cached to disk, so the API is called only once per
-        // novel format regardless of how many times the file is processed.
-        println!("{}", "Format not recognised — asking LLM to infer schema…".yellow());
+        println!(
+            "{}",
+            "Format not recognised — asking LLM to infer schema…".yellow()
+        );
         Box::new(AiInferredParser::new(&sample).await?)
     };
 
     // -----------------------------------------------------------------------
-    // 3. Parse all lines with the selected parser
+    // 3. Parse all lines
     // -----------------------------------------------------------------------
 
     let mut records = Vec::new();
@@ -106,9 +153,6 @@ async fn main() -> Result<()> {
         }
         match parser.parse(line) {
             Ok(record) => records.push(record),
-            // Skip malformed lines silently and count them for the summary.
-            // Failing the whole run on one bad line would be too brittle for
-            // real log files, which often contain partial or mixed-format lines.
             Err(_) => skipped += 1,
         }
     }
@@ -135,12 +179,9 @@ async fn main() -> Result<()> {
     println!();
 
     // -----------------------------------------------------------------------
-    // 5. AI analysis via the trait object
+    // 5. AI analysis
     // -----------------------------------------------------------------------
 
-    // Constructing `AnthropicEngine` reads the API key; if absent, it returns
-    // an `Err` which we catch here to print a human-readable message and exit
-    // rather than letting anyhow print a raw error chain.
     let engine: Box<dyn AnalysisEngine> = match AnthropicEngine::new() {
         Ok(e) => Box::new(e),
         Err(_) => {
@@ -155,8 +196,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Call through the trait object — main.rs is intentionally ignorant of
-    // whether the engine is Anthropic, a mock, or a future Python microservice.
+    // Call through the trait object — main.rs never references AnthropicEngine
+    // methods directly; everything goes through the AnalysisEngine trait.
     let result = engine.analyse(&summary).await?;
 
     println!("{}", "Analysis".bold().underline());
