@@ -64,6 +64,7 @@ mod tests {
             status_counts: HashMap::new(),
             top_errors: vec![],
             top_slow_paths: vec![],
+            suspicious_ips: vec![],
         }
     }
 

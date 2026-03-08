@@ -206,6 +206,7 @@ mod tests {
             status_counts,
             top_errors: vec![],
             top_slow_paths: vec![],
+            suspicious_ips: vec![],
         }
     }
 
