@@ -85,6 +85,10 @@ mod tests {
                 assert_eq!(r.bytes, 5432);
                 assert_eq!(r.timestamp, "07/Mar/2026:09:12:03 -0500");
             }
+            // Wildcard arm required because LogRecord has multiple variants.
+            // ApacheParser can only produce Apache records, so this path is
+            // unreachable in practice; panic makes any regression obvious.
+            _ => panic!("expected LogRecord::Apache, got a different variant"),
         }
     }
 

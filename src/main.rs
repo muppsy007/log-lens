@@ -14,8 +14,9 @@ use colored::Colorize;
 
 use aggregator::aggregate;
 use ai::{anthropic::AnthropicEngine, AnalysisEngine};
+use parser::ai_infer::AiInferredParser;
 use parser::apache::ApacheParser;
-// Import our Parser trait so `.parse()` is in scope on `ApacheParser`.
+// Import our Parser trait so `.parse()` is in scope on both parser types.
 use parser::Parser;
 use summary::to_json;
 
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // -----------------------------------------------------------------------
-    // 1. Parse the log file
+    // 1. Read file into memory
     // -----------------------------------------------------------------------
 
     let file = File::open(&cli.file)
@@ -45,26 +46,65 @@ async fn main() -> Result<()> {
         // user sees "Could not open file: foo.log" instead of a bare OS error.
         .with_context(|| format!("Could not open file: {}", cli.file))?;
 
-    // `BufReader` wraps the file to buffer reads, which is far more efficient
-    // than reading one byte at a time through the OS syscall layer.
-    let reader = BufReader::new(file);
+    // Collect all lines upfront so we can sample them for format detection
+    // before choosing a parser, without reading the file twice.
+    // `BufReader` buffers the read to avoid per-byte OS syscalls.
+    let lines: Vec<String> = BufReader::new(file)
+        .lines()
+        // `collect::<io::Result<Vec<_>>>()` short-circuits on the first IO error.
+        .collect::<std::io::Result<Vec<_>>>()?;
 
-    // Initialise once and reuse — the compiled regex lives in `ApacheParser`.
-    let parser = ApacheParser::new()?;
+    // -----------------------------------------------------------------------
+    // 2. Format detection (Tier 2 → Tier 3)
+    // -----------------------------------------------------------------------
+
+    // Sample up to 20 non-empty lines for detection.
+    let sample: Vec<&str> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .take(20)
+        .map(String::as_str)
+        .collect();
+
+    if sample.is_empty() {
+        eprintln!("{}", "No non-empty lines found in file.".red());
+        std::process::exit(1);
+    }
+
+    // Tier 2: heuristic check — try Apache parser on the first 5 sample lines.
+    // Five lines is enough to rule out coincidental partial matches on a header.
+    let apache_parser = ApacheParser::new()?;
+    let tier2_sample = &sample[..sample.len().min(5)];
+    let apache_hits = tier2_sample
+        .iter()
+        .filter(|l| apache_parser.parse(l).is_ok())
+        .count();
+
+    // Use Apache if the majority of the sample matches; otherwise fall through
+    // to Tier 3. The `* 2 >= len` trick avoids floating-point division.
+    let parser: Box<dyn Parser> = if apache_hits * 2 >= tier2_sample.len() {
+        println!("{}", "Detected format: Apache Combined Log".dimmed());
+        Box::new(apache_parser)
+    } else {
+        // Tier 3: send up to 20 sample lines to the LLM to infer a regex.
+        // The result is cached to disk, so the API is called only once per
+        // novel format regardless of how many times the file is processed.
+        println!("{}", "Format not recognised — asking LLM to infer schema…".yellow());
+        Box::new(AiInferredParser::new(&sample).await?)
+    };
+
+    // -----------------------------------------------------------------------
+    // 3. Parse all lines with the selected parser
+    // -----------------------------------------------------------------------
 
     let mut records = Vec::new();
     let mut skipped: usize = 0;
 
-    for line in reader.lines() {
-        // Each `line` is `io::Result<String>`; the `?` propagates IO errors
-        // (e.g. permission denied mid-read) while we handle parse errors below.
-        let line = line?;
-
+    for line in &lines {
         if line.trim().is_empty() {
             continue;
         }
-
-        match parser.parse(&line) {
+        match parser.parse(line) {
             Ok(record) => records.push(record),
             // Skip malformed lines silently and count them for the summary.
             // Failing the whole run on one bad line would be too brittle for
@@ -83,13 +123,10 @@ async fn main() -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Aggregate
+    // 4. Aggregate
     // -----------------------------------------------------------------------
 
     let summary = aggregate(records);
-
-    // Serialise to JSON for diagnostic printing; the `_` prefix signals that
-    // the binding is intentionally unused in the happy path.
     let summary_json = to_json(&summary)?;
 
     println!("{}", format!("Analysing {} log records…", summary.total).bold());
@@ -98,7 +135,7 @@ async fn main() -> Result<()> {
     println!();
 
     // -----------------------------------------------------------------------
-    // 3. AI analysis via the trait object
+    // 5. AI analysis via the trait object
     // -----------------------------------------------------------------------
 
     // Constructing `AnthropicEngine` reads the API key; if absent, it returns

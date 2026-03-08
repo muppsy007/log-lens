@@ -41,6 +41,18 @@ pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
                 // inserts 0 on first sight, then the `+= 1` updates in place.
                 *status_counts.entry(r.status).or_insert(0) += 1;
             }
+            LogRecord::Inferred(r) => {
+                // Inferred records carry free-form fields; try common status
+                // field names in priority order. `find_map` short-circuits on
+                // the first name that exists in the map AND parses as u16.
+                let status = ["status", "status_code", "code", "http_status"]
+                    .iter()
+                    .find_map(|&k| r.fields.get(k))
+                    .and_then(|v| v.parse::<u16>().ok());
+                if let Some(s) = status {
+                    *status_counts.entry(s).or_insert(0) += 1;
+                }
+            }
         }
     }
 
