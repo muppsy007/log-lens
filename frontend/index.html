@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>log-lens</title>
+
+  <!--
+    Chart.js loaded from cdnjs — no build step, no npm, no bundler.
+    The `crossorigin` attribute is required so the browser applies the
+    SRI check (if added later) and avoids a Tainting issue for canvas exports.
+  -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
+          crossorigin="anonymous"
+          referrerpolicy="no-referrer"></script>
+
+  <style>
+    /* ── Reset ──────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ── Design tokens — GitHub-dark-inspired palette ───────────────────── */
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --border:   #30363d;
+      --text:     #c9d1d9;
+      --muted:    #8b949e;
+      --accent:   #58a6ff;
+      --green:    #3fb950;
+      --red:      #f85149;
+      --yellow:   #d29922;
+      --blue:     #58a6ff;
+      --radius:   8px;
+    }
+
+    /* ── Base ────────────────────────────────────────────────────────────── */
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────── */
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    header h1 {
+      font-family: monospace;
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    header .tagline {
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+
+    /* ── Main layout ─────────────────────────────────────────────────────── */
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    /* ── Input row ──────────────────────────────────────────────────────── */
+    .input-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .input-row input {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 14px;
+      color: var(--text);
+      font-family: monospace;
+      font-size: 0.9rem;
+      outline: none;
+      /* Transition makes the focus ring feel responsive, not jumpy. */
+      transition: border-color 0.15s;
+    }
+
+    .input-row input:focus { border-color: var(--accent); }
+    .input-row input::placeholder { color: var(--muted); }
+
+    button {
+      background: var(--accent);
+      color: #0d1117;
+      border: none;
+      border-radius: var(--radius);
+      padding: 10px 22px;
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.15s;
+    }
+
+    button:hover:not(:disabled) { opacity: 0.85; }
+
+    /* `disabled` state is set via JS while the fetch is in-flight. */
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    /* ── Loading indicator ─────────────────────────────────────────────── */
+    /*
+      Hidden by default; JS toggles `.visible` to show it.
+      Using a class toggle (not display:none → display:flex directly)
+      avoids a layout recalc on every state change.
+    */
+    .loading {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+    .loading.visible { display: flex; }
+
+    .spinner {
+      width: 17px;
+      height: 17px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      /* Single animation declaration — the browser composes this cheaply. */
+      animation: spin 0.7s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Error box ─────────────────────────────────────────────────────── */
+    .error-box {
+      display: none;
+      background: #2d1316;      /* dark red surface — no color-mix() for wider support */
+      border: 1px solid #6e1f23;
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      color: var(--red);
+      font-size: 0.9rem;
+      font-family: monospace;
+      white-space: pre-wrap;    /* preserve server error messages as-is */
+    }
+    .error-box.visible { display: block; }
+
+    /* ── Results container ─────────────────────────────────────────────── */
+    /*
+      Hidden until the first successful response so there is no empty-state
+      flash on page load. We use a wrapper element (not individual card
+      display toggles) so a single class change reveals everything at once.
+    */
+    #results {
+      display: none;
+      flex-direction: column;
+      gap: 24px;
+    }
+    #results.visible { display: flex; }
+
+    /* ── Cards ─────────────────────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+    }
+
+    .card-label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    /* ── Analysis text ─────────────────────────────────────────────────── */
+    #analysis-text {
+      font-size: 0.95rem;
+      line-height: 1.75;
+      /* pre-wrap preserves paragraphs the LLM may include in its response. */
+      white-space: pre-wrap;
+    }
+
+    /* ── Stat row ──────────────────────────────────────────────────────── */
+    .stats-row {
+      display: grid;
+      /* auto-fit collapses empty columns on narrow viewports automatically. */
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+    }
+
+    .stat-value {
+      font-size: 2.2rem;
+      font-weight: 700;
+      font-family: monospace;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    /* Colour variants applied by JS based on the value. */
+    .stat-value.red   { color: var(--red); }
+    .stat-value.green { color: var(--green); }
+    .stat-value.muted { color: var(--muted); }
+
+    .stat-label {
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    /* ── Chart ─────────────────────────────────────────────────────────── */
+    .chart-wrap {
+      position: relative;
+      /*
+        Fixed height + maintainAspectRatio:false (set in Chart.js options)
+        lets the chart fill exactly this box regardless of canvas width.
+      */
+      height: 280px;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>log-lens</h1>
+    <span class="tagline">AI-powered log analysis</span>
+  </header>
+
+  <main>
+
+    <!-- ── Log file path input ─────────────────────────────────────────── -->
+    <!--
+      A text field (not a file picker) because the server reads the path
+      directly from disk — the browser never transfers the file contents.
+    -->
+    <div class="input-row">
+      <input
+        id="file-input"
+        type="text"
+        placeholder="samples/apache-access.log"
+        value="samples/apache-access.log"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button id="submit-btn" onclick="analyse()">Analyse</button>
+    </div>
+
+    <!-- ── Loading indicator ───────────────────────────────────────────── -->
+    <div class="loading" id="loading">
+      <div class="spinner"></div>
+      <span>Analysing log file…</span>
+    </div>
+
+    <!-- ── Error display ───────────────────────────────────────────────── -->
+    <div class="error-box" id="error-box"></div>
+
+    <!-- ── Results (hidden until first successful response) ────────────── -->
+    <div id="results">
+
+      <!-- AI analysis — most prominent element, top of the results -->
+      <div class="card">
+        <div class="card-label">AI Analysis</div>
+        <div id="analysis-text"></div>
+      </div>
+
+      <!-- Numeric summary stats -->
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-value" id="error-rate-value">—</div>
+          <div class="stat-label">Error rate (5xx)</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value muted" id="total-value">—</div>
+          <div class="stat-label">Total records</div>
+        </div>
+      </div>
+
+      <!-- Status code distribution chart -->
+      <div class="card">
+        <div class="card-label">Status Code Distribution</div>
+        <div class="chart-wrap">
+          <canvas id="status-chart"></canvas>
+        </div>
+      </div>
+
+    </div><!-- #results -->
+  </main>
+
+  <script>
+    /*
+      `chart` is kept at module scope so we can call `.destroy()` before
+      creating a new chart on the same canvas. Without this, Chart.js
+      stacks multiple chart instances on one canvas and logs a warning.
+    */
+    let chart = null;
+
+    /* ── Main action ──────────────────────────────────────────────────── */
+
+    async function analyse() {
+      const path = document.getElementById('file-input').value.trim();
+      if (!path) return;
+
+      setLoading(true);
+      clearError();
+      hideResults();
+
+      try {
+        /*
+          encodeURIComponent converts '/' → '%2F' so path separators survive
+          the query string intact. Axum's Query extractor percent-decodes the
+          value before handing it to the handler, so the server sees the
+          original path with real slashes.
+        */
+        const url = `/api/summary?file=${encodeURIComponent(path)}`;
+        const res = await fetch(url);
+
+        if (!res.ok) {
+          /*
+            Read the plain-text body the server sends on error (AppError
+            returns the anyhow message as the body, not JSON).
+          */
+          const msg = await res.text();
+          throw new Error(`Server returned ${res.status}: ${msg}`);
+        }
+
+        const data = await res.json();
+        render(data);
+
+      } catch (err) {
+        showError(err.message);
+      } finally {
+        /*
+          `finally` runs whether the fetch succeeded or failed, so the
+          button is always re-enabled — no way to get stuck in loading state.
+        */
+        setLoading(false);
+      }
+    }
+
+    /* ── Render ───────────────────────────────────────────────────────── */
+
+    function render(data) {
+      const { summary, analysis } = data;
+
+      // --- Analysis card ---
+      document.getElementById('analysis-text').textContent = analysis;
+
+      // --- Error rate stat ---
+      const pct = (summary.error_rate * 100).toFixed(1) + '%';
+      const errEl = document.getElementById('error-rate-value');
+      errEl.textContent = pct;
+      /*
+        Ternary picks the colour class: red draws attention when there are
+        server errors; green gives positive confirmation when there are none.
+      */
+      errEl.className = 'stat-value ' + (summary.error_rate > 0 ? 'red' : 'green');
+
+      // --- Total records stat ---
+      /*
+        toLocaleString() formats with thousands separators using the user's
+        locale, so 123456 becomes "123,456" in en-US or "123.456" in de-DE.
+      */
+      document.getElementById('total-value').textContent =
+        summary.total.toLocaleString();
+
+      // --- Chart ---
+      renderChart(summary.status_counts);
+
+      // Reveal the results section now that all fields are populated.
+      document.getElementById('results').classList.add('visible');
+    }
+
+    function renderChart(statusCounts) {
+      /*
+        Sort labels numerically (HTTP codes are integers) so the bars always
+        read left-to-right in ascending order: 200, 301, 404, 500, …
+        JSON key order is not guaranteed, so we sort explicitly.
+      */
+      const labels = Object.keys(statusCounts).sort((a, b) => +a - +b);
+      const values = labels.map(k => statusCounts[k]);
+
+      /*
+        Assign a colour based on HTTP status class so the chart is
+        immediately readable without a legend:
+          2xx → green  (success)
+          3xx → blue   (redirect)
+          4xx → yellow (client error)
+          5xx → red    (server error)
+      */
+      const colors = labels.map(code => {
+        const n = parseInt(code, 10);
+        if (n < 300) return '#3fb950';
+        if (n < 400) return '#58a6ff';
+        if (n < 500) return '#d29922';
+        return '#f85149';
+      });
+
+      // Destroy the previous instance so Chart.js doesn't accumulate
+      // hidden canvases and leak tooltip/animation state between analyses.
+      if (chart) chart.destroy();
+
+      const ctx = document.getElementById('status-chart').getContext('2d');
+      chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Requests',
+            data: values,
+            backgroundColor: colors,
+            borderRadius: 4,
+            // `borderSkipped: false` applies the border-radius to all four
+            // corners of each bar, including the base — looks cleaner on dark bg.
+            borderSkipped: false,
+          }],
+        },
+        options: {
+          responsive: true,
+          /*
+            `maintainAspectRatio: false` lets the canvas fill the .chart-wrap
+            height (set in CSS) rather than enforcing Chart.js's default 2:1
+            width-to-height ratio, which would make the chart too short.
+          */
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              callbacks: {
+                // Prefix "HTTP" so tooltips read "HTTP 200" not just "200".
+                title: items => `HTTP ${items[0].label}`,
+              },
+            },
+          },
+          scales: {
+            x: {
+              ticks: { color: '#8b949e' },
+              grid:  { color: '#21262d' },
+            },
+            y: {
+              ticks:       { color: '#8b949e', precision: 0 },
+              grid:        { color: '#21262d' },
+              /*
+                `beginAtZero` anchors the y-axis at 0 even when all counts
+                are large. Without it, Chart.js may auto-scale in a way that
+                exaggerates small differences between bars.
+              */
+              beginAtZero: true,
+            },
+          },
+        },
+      });
+    }
+
+    /* ── UI state helpers ─────────────────────────────────────────────── */
+
+    function setLoading(on) {
+      document.getElementById('loading').classList.toggle('visible', on);
+      // Disable the button while loading to prevent duplicate submissions.
+      document.getElementById('submit-btn').disabled = on;
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('error-box');
+      el.textContent = msg;
+      el.classList.add('visible');
+    }
+
+    function clearError() {
+      document.getElementById('error-box').classList.remove('visible');
+    }
+
+    function hideResults() {
+      document.getElementById('results').classList.remove('visible');
+    }
+
+    /* ── Keyboard shortcut ────────────────────────────────────────────── */
+
+    /*
+      Submitting with Enter makes the workflow feel like a terminal —
+      natural for a developer tool where the user expects keyboard-driven UX.
+    */
+    document.getElementById('file-input')
+      .addEventListener('keydown', e => { if (e.key === 'Enter') analyse(); });
+  </script>
+</body>
+</html>

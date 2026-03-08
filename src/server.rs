@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 
 use crate::aggregator::{aggregate, LogSummary};
 use crate::ai::{AnalysisEngine, Message};
@@ -99,6 +100,11 @@ pub fn build_router(engine: Box<dyn AnalysisEngine>) -> Router {
         .route("/api/summary", get(summary_handler))
         .route("/api/chat", post(chat_handler))
         .with_state(engine)
+        // `fallback_service` catches every request that does not match an API
+        // route. `ServeDir` walks the `frontend/` directory relative to the
+        // working directory (the project root when run via `cargo run`).
+        // `append_index_html_on_directories` makes `GET /` serve `index.html`.
+        .fallback_service(ServeDir::new("frontend").append_index_html_on_directories(true))
         // Permissive CORS so the single-file frontend can call the API from
         // any origin during local development without proxy configuration.
         .layer(CorsLayer::permissive())
