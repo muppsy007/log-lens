@@ -3,7 +3,7 @@ pub mod mock;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::aggregator::LogSummary;
 
@@ -24,7 +24,7 @@ pub struct AnalysisResult {
 /// so the struct maps directly to API request bodies without transformation.
 /// `Clone` is derived because the server will need to append to and pass
 /// history slices without consuming the stored vec.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     /// Either "user" or "assistant".
     pub role: String,
