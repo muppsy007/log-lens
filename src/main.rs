@@ -201,7 +201,22 @@ async fn run_analysis(file_path: &str) -> Result<()> {
     let result = engine.analyse(&summary).await?;
 
     println!("{}", "Analysis".bold().underline());
-    println!("{}", result.text);
+    if result.issues.is_empty() {
+        // Fallback: model returned prose instead of JSON.
+        if let Some(raw) = &result.raw {
+            println!("{raw}");
+        }
+    } else {
+        for issue in &result.issues {
+            println!(
+                "[{}] {} — {}  → {}",
+                issue.severity.to_uppercase(),
+                issue.title,
+                issue.explanation,
+                issue.action
+            );
+        }
+    }
 
     Ok(())
 }

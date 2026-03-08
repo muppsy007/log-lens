@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::{AnalysisEngine, AnalysisResult, Message};
+use super::{AnalysisEngine, AnalysisResult, Issue, Message};
 use crate::aggregator::LogSummary;
 
 /// A test double for `AnalysisEngine` that returns canned responses.
@@ -17,15 +17,25 @@ pub struct MockEngine;
 #[async_trait]
 impl AnalysisEngine for MockEngine {
     async fn analyse(&self, summary: &LogSummary) -> Result<AnalysisResult> {
-        // We reference `summary` here so the compiler does not warn about the
-        // unused parameter; the format string interpolates the total count to
-        // make the canned response loosely reflect the input.
         Ok(AnalysisResult {
-            text: format!(
-                "Mock analysis: processed {} log records. \
-                 No anomalies detected (this is a canned response).",
-                summary.total
-            ),
+            issues: vec![
+                Issue {
+                    severity: "critical".to_string(),
+                    title: "Mock critical issue".to_string(),
+                    explanation: format!(
+                        "Mock analysis: processed {} log records with elevated error rate.",
+                        summary.total
+                    ),
+                    action: "Investigate the root cause immediately.".to_string(),
+                },
+                Issue {
+                    severity: "warning".to_string(),
+                    title: "Mock warning issue".to_string(),
+                    explanation: "Some paths returned 4xx responses.".to_string(),
+                    action: "Review client request patterns.".to_string(),
+                },
+            ],
+            raw: None,
         })
     }
 
@@ -47,31 +57,30 @@ mod tests {
     use super::*;
 
     /// Constructs a minimal `LogSummary` for use in tests.
-    /// Lives here rather than in a shared helper module because it is only
-    /// needed by this test module at this stage of the build.
     fn stub_summary() -> LogSummary {
         LogSummary {
             total: 42,
             error_rate: 0.1,
-            // `HashMap::new()` is fine here — the mock ignores status_counts.
             status_counts: HashMap::new(),
+            top_errors: vec![],
+            top_slow_paths: vec![],
         }
     }
 
-    // `#[tokio::test]` replaces `#[test]` for async test functions.
-    // It spins up a single-threaded Tokio runtime for the test, matching the
-    // minimal overhead needed for unit tests (no need for the full multi-thread pool).
     #[tokio::test]
-    async fn analyse_returns_canned_result() {
+    async fn analyse_returns_structured_result() {
         let engine = MockEngine;
         let result = engine
             .analyse(&stub_summary())
             .await
             .expect("mock must not fail");
 
-        // Assert the total count was interpolated into the canned text.
-        assert!(result.text.contains("42"));
-        assert!(result.text.contains("Mock analysis"));
+        assert!(!result.issues.is_empty(), "must return at least one issue");
+        // The critical issue explanation interpolates the total count.
+        assert!(result.issues[0].explanation.contains("42"));
+        assert_eq!(result.issues[0].severity, "critical");
+        assert_eq!(result.issues[1].severity, "warning");
+        assert!(result.raw.is_none());
     }
 
     #[tokio::test]

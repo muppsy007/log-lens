@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::{AnalysisEngine, AnalysisResult, Message};
+use crate::summary::to_json;
 use crate::aggregator::LogSummary;
 
 /// Model used for all API calls. Defined as a constant so it appears in one
@@ -98,14 +99,21 @@ impl AnthropicEngine {
 #[async_trait]
 impl AnalysisEngine for AnthropicEngine {
     async fn analyse(&self, summary: &LogSummary) -> Result<AnalysisResult> {
-        // Serialise to JSON so the LLM receives structured data it can reason
-        // about precisely, rather than a human-formatted string that would need
-        // re-parsing. Raw log lines are never sent — only the aggregated summary.
-        let summary_json = serde_json::to_string(summary)?;
+        // Serialise to compact JSON — only the aggregated summary is transmitted,
+        // never raw log lines. `to_json` from summary.rs handles this.
+        let summary_json = to_json(summary)?;
 
         let prompt = format!(
-            "You are a log analysis expert. Given this log summary in JSON, \
-             identify issues and explain them in plain English: {summary_json}"
+            "You are a senior engineer triaging a production incident.\n\
+             Analyse this log summary and return ONLY a JSON object — no prose, no markdown, no explanation outside the JSON.\n\
+             \n\
+             Return this exact shape:\n\
+             {{\"issues\": [{{\"severity\": \"critical|warning|info\", \"title\": \"short label\", \"explanation\": \"1-2 sentences on what is wrong\", \"action\": \"concrete next step\"}}]}}\n\
+             \n\
+             Order issues by severity: critical first. Be specific — reference actual counts and paths from the data. Do not invent data not present in the summary.\n\
+             \n\
+             Log summary:\n\
+             {summary_json}"
         );
 
         let messages = vec![ApiMessage {
@@ -114,7 +122,16 @@ impl AnalysisEngine for AnthropicEngine {
         }];
 
         let text = self.call_api(messages).await?;
-        Ok(AnalysisResult { text })
+
+        // Parse the JSON response; fall back to `raw` if the model included
+        // prose or markdown that prevents clean deserialization.
+        let result = serde_json::from_str::<AnalysisResult>(&text)
+            .unwrap_or_else(|_| AnalysisResult {
+                issues: vec![],
+                raw: Some(text),
+            });
+
+        Ok(result)
     }
 
     async fn chat(&self, history: &[Message], question: &str) -> Result<String> {
@@ -187,6 +204,8 @@ mod tests {
             total: 100,
             error_rate: 0.05,
             status_counts,
+            top_errors: vec![],
+            top_slow_paths: vec![],
         }
     }
 
@@ -205,7 +224,10 @@ mod tests {
             .analyse(&stub_summary())
             .await
             .expect("API call must succeed");
-        assert!(!result.text.is_empty(), "analysis text must not be empty");
+        assert!(
+            !result.issues.is_empty() || result.raw.is_some(),
+            "analysis must contain issues or a raw fallback"
+        );
     }
 
     #[tokio::test]

@@ -185,12 +185,62 @@
       margin-bottom: 12px;
     }
 
-    /* ── Analysis text ─────────────────────────────────────────────────── */
-    #analysis-text {
-      font-size: 0.95rem;
-      line-height: 1.75;
-      /* pre-wrap preserves paragraphs the LLM may include in its response. */
+    /* ── Issue triage cards ─────────────────────────────────────────────── */
+    .issue-card {
+      border-left: 4px solid;
+      padding: 12px 16px;
+      margin-bottom: 12px;
+      border-radius: 4px;
+      background: rgba(255,255,255,0.05);
+    }
+
+    .issue-critical { border-color: #ef4444; }
+    .issue-warning  { border-color: #f59e0b; }
+    .issue-info     { border-color: #3b82f6; }
+
+    .badge {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 2px 8px;
+      border-radius: 99px;
+      margin-right: 8px;
+    }
+
+    .issue-critical .badge { background: #ef4444; color: white; }
+    .issue-warning  .badge { background: #f59e0b; color: black; }
+    .issue-info     .badge { background: #3b82f6; color: white; }
+
+    .action {
+      color: #9ca3af;
+      font-size: 0.9rem;
+      margin-top: 6px;
+    }
+
+    /* ── Raw / empty fallbacks ──────────────────────────────────────────── */
+    .raw-fallback {
+      background: #1f1a02;
+      border: 1px solid #5a4a00;
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      color: var(--yellow);
+      font-size: 0.88rem;
       white-space: pre-wrap;
+    }
+
+    .raw-fallback-label {
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 8px;
+      opacity: 0.7;
+    }
+
+    .no-issues {
+      color: var(--muted);
+      font-size: 0.9rem;
     }
 
     /* ── Stat row ──────────────────────────────────────────────────────── */
@@ -280,7 +330,7 @@
       <!-- AI analysis — most prominent element, top of the results -->
       <div class="card">
         <div class="card-label">AI Analysis</div>
-        <div id="analysis-text"></div>
+        <div id="issue-list" class="issue-list"></div>
       </div>
 
       <!-- Numeric summary stats -->
@@ -362,8 +412,8 @@
     function render(data) {
       const { summary, analysis } = data;
 
-      // --- Analysis card ---
-      document.getElementById('analysis-text').textContent = analysis;
+      // --- Triage issue cards ---
+      renderIssues(analysis);
 
       // --- Error rate stat ---
       const pct = (summary.error_rate * 100).toFixed(1) + '%';
@@ -388,6 +438,56 @@
 
       // Reveal the results section now that all fields are populated.
       document.getElementById('results').classList.add('visible');
+    }
+
+    function renderIssues(analysis) {
+      const container = document.getElementById('issue-list');
+      container.innerHTML = '';
+
+      if (analysis.issues && analysis.issues.length > 0) {
+        // One card per issue; server orders them critical-first already.
+        for (const issue of analysis.issues) {
+          const sev = issue.severity || 'info';
+          const card = document.createElement('div');
+          card.className = `issue-card issue-${sev}`;
+          card.innerHTML =
+            `<span class="badge">${escHtml(sev)}</span>` +
+            `<strong>${escHtml(issue.title)}</strong>` +
+            `<p>${escHtml(issue.explanation)}</p>` +
+            `<p class="action">→ ${escHtml(issue.action)}</p>`;
+          container.appendChild(card);
+        }
+      } else if (analysis.raw) {
+        // LLM returned prose instead of JSON — show it labelled.
+        const box = document.createElement('div');
+        box.className = 'raw-fallback';
+        const label = document.createElement('div');
+        label.className = 'raw-fallback-label';
+        label.textContent = 'Unstructured response';
+        const body = document.createElement('div');
+        body.textContent = analysis.raw;
+        box.appendChild(label);
+        box.appendChild(body);
+        container.appendChild(box);
+      } else {
+        // Both empty — positive confirmation that the log is clean.
+        const msg = document.createElement('p');
+        msg.className = 'no-issues';
+        msg.textContent = 'No issues detected.';
+        container.appendChild(msg);
+      }
+    }
+
+    /*
+      Escape HTML special characters before inserting user-originated or
+      LLM-originated text into innerHTML to prevent accidental XSS.
+    */
+    function escHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
     }
 
     function renderChart(statusCounts) {

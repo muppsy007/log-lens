@@ -36,6 +36,8 @@ mod tests {
             // 1 out of 4 records is a 5xx error
             error_rate: 0.25,
             status_counts,
+            top_errors: vec![],
+            top_slow_paths: vec![],
         };
 
         let json = to_json(&summary).expect("serialisation must succeed");

@@ -15,7 +15,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::aggregator::{aggregate, LogSummary};
-use crate::ai::{AnalysisEngine, Message};
+use crate::ai::{AnalysisEngine, AnalysisResult, Message};
 use crate::parser::ai_infer::AiInferredParser;
 use crate::parser::apache::ApacheParser;
 // Import Parser trait so `.parse()` is in scope on both parser types.
@@ -35,8 +35,8 @@ struct SummaryQuery {
 #[derive(Serialize)]
 struct SummaryResponse {
     summary: LogSummary,
-    /// Plain-English analysis produced by the AI layer.
-    analysis: String,
+    /// Structured triage analysis produced by the AI layer.
+    analysis: AnalysisResult,
 }
 
 /// Request body for POST /api/chat.
@@ -141,10 +141,7 @@ async fn summary_handler(
     // Handlers must never call AnthropicEngine methods directly — only the trait.
     let analysis = engine.analyse(&summary).await?;
 
-    Ok(Json(SummaryResponse {
-        summary,
-        analysis: analysis.text,
-    }))
+    Ok(Json(SummaryResponse { summary, analysis }))
 }
 
 async fn chat_handler(
@@ -224,8 +221,6 @@ mod tests {
     use tower::ServiceExt;
 
     // Helper that reads a response body into raw bytes.
-    // `http_body_util::BodyExt` is not in scope automatically; we import its
-    // trait here to bring `.collect()` into scope on the response body.
     async fn body_bytes(body: axum::body::Body) -> bytes::Bytes {
         use http_body_util::BodyExt;
         body.collect().await.expect("body must be readable").to_bytes()
@@ -255,10 +250,16 @@ mod tests {
 
         assert!(json.get("summary").is_some(), "response must have 'summary' field");
         assert!(json.get("analysis").is_some(), "response must have 'analysis' field");
-        // Sanity-check that the mock's canned text made it into the response.
-        assert!(
-            json["analysis"].as_str().unwrap().contains("Mock analysis"),
-            "analysis must contain mock text"
+
+        // The mock returns structured issues — verify the shape.
+        let issues = json["analysis"]["issues"]
+            .as_array()
+            .expect("analysis.issues must be an array");
+        assert!(!issues.is_empty(), "mock must return at least one issue");
+        assert_eq!(
+            issues[0]["severity"].as_str().unwrap(),
+            "critical",
+            "first issue must be critical"
         );
     }
 
@@ -267,6 +268,8 @@ mod tests {
         let app = build_router(Box::new(MockEngine));
 
         // Construct a minimal but valid ChatRequest body.
+        // The new `top_errors` and `top_slow_paths` fields have `#[serde(default)]`
+        // so they are not required in the JSON body.
         let body = serde_json::json!({
             "question": "What is the error rate?",
             "history": [],
