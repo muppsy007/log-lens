@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod mock;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::aggregator::LogSummary;
@@ -33,21 +34,19 @@ pub struct Message {
 /// The single interface the server and CLI use for all AI interactions.
 ///
 /// # Why `Send + Sync`
-/// The trait will be held behind `Arc<dyn AnalysisEngine>` in the Axum server
-/// so it can be shared across async tasks on the Tokio thread pool. Both bounds
-/// are required: `Send` to move across threads, `Sync` to share a reference.
+/// The trait is held behind `Box<dyn AnalysisEngine>` in the CLI and will be
+/// held behind `Arc<dyn AnalysisEngine>` in the Axum server, shared across
+/// Tokio tasks. `Send` allows the value to move between threads; `Sync` allows
+/// a shared reference to cross thread boundaries.
 ///
-/// # Why native async fn (not `async-trait`)
-/// Rust 1.75+ stabilised `async fn` in traits. We use it here because:
-/// - No extra crate dependency or macro expansion overhead.
-/// - The compiler desugars each method to an RPITIT (return-position impl
-///   trait in trait), which is zero-cost compared to `async-trait`'s
-///   heap-allocated `Pin<Box<dyn Future>>`.
-///
-/// The trade-off: methods with native `async fn` are not yet usable through
-/// `dyn AnalysisEngine` directly. When the server needs dynamic dispatch it
-/// will use the `async-trait` crate or a hand-rolled `Box<dyn Future>` shim.
-/// That decision is deferred to the implementation step (ai/anthropic.rs).
+/// # Why `#[async_trait]`
+/// Native `async fn` in traits (stable since Rust 1.75) produces
+/// RPITIT futures that are not object-safe: the compiler cannot build a vtable
+/// for them. `#[async_trait]` rewrites each `async fn` to return
+/// `Pin<Box<dyn Future + Send>>`, which IS object-safe and allows
+/// `Box<dyn AnalysisEngine>` / `Arc<dyn AnalysisEngine>` to work.
+/// The heap allocation per call is acceptable here — API latency dominates.
+#[async_trait]
 pub trait AnalysisEngine: Send + Sync {
     /// Produce a plain-English analysis of the aggregated log data.
     ///

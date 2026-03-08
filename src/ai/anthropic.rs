@@ -1,6 +1,7 @@
 use std::env;
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +95,7 @@ impl AnthropicEngine {
     }
 }
 
+#[async_trait]
 impl AnalysisEngine for AnthropicEngine {
     async fn analyse(&self, summary: &LogSummary) -> Result<AnalysisResult> {
         // Serialise to JSON so the LLM receives structured data it can reason

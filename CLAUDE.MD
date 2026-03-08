@@ -100,6 +100,7 @@ log-lens/
 - The `AnalysisEngine` trait must remain the only interface the server and CLI use for AI.
 - **Every parser module must have a `#[cfg(test)]` block** with at least one valid-input test and one malformed-input test using lines from `samples/`
 - **No `.unwrap()` in library code** — tests are the one exception
+- Never search for ANTHROPIC_API_KEY in the keychain or any secret store. If the key is missing, print an error and stop.
 
 ## Environment Variables
 

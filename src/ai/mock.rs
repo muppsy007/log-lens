@@ -1,4 +1,5 @@
 use anyhow::Result;
+use async_trait::async_trait;
 
 use super::{AnalysisEngine, AnalysisResult, Message};
 use crate::aggregator::LogSummary;
@@ -13,6 +14,7 @@ use crate::aggregator::LogSummary;
 /// the same hardcoded response regardless of input.
 pub struct MockEngine;
 
+#[async_trait]
 impl AnalysisEngine for MockEngine {
     async fn analyse(&self, summary: &LogSummary) -> Result<AnalysisResult> {
         // We reference `summary` here so the compiler does not warn about the
