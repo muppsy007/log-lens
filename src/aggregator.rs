@@ -4,6 +4,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::parser::LogRecord;
 
+/// Sample log lines associated with a particular error pattern.
+/// Used to attach representative evidence to triage issues without ever
+/// sending raw lines to the LLM (the join happens post-analysis).
+#[derive(Debug, Clone)]
+pub struct ErrorEvidence {
+    /// The error path (or message prefix) used as the grouping key.
+    pub pattern: String,
+    /// Total number of error occurrences for this pattern.
+    pub count: u32,
+    /// Up to 10 raw log lines that matched this pattern.
+    pub sample_lines: Vec<String>,
+}
+
+/// Combined output of the aggregation pipeline.
+///
+/// `summary` is the data that gets serialised and sent to the LLM.
+/// `evidence` is kept separate — it contains raw log lines that must
+/// NEVER be included in any LLM payload.
+#[derive(Debug, Clone)]
+pub struct AggregatorOutput {
+    pub summary: LogSummary,
+    pub evidence: Vec<ErrorEvidence>,
+}
+
 /// An IP address flagged as suspicious by one or more heuristics.
 ///
 /// Serialised into `LogSummary` so the AI layer can reference specific IPs
@@ -52,16 +76,18 @@ fn is_traversal_path(path: &str) -> bool {
     path.contains("../") || path.contains("..\\") || path.contains("etc/passwd")
 }
 
-/// Aggregates a batch of parsed log records into a `LogSummary`.
+/// Aggregates a batch of parsed log records into a `LogSummary` plus raw-line evidence.
 ///
 /// Accepts ownership of the `Vec` so callers make the move/clone decision
 /// explicitly; we never need to read the records again after aggregation.
-pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
+pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
     let total = records.len() as u64;
 
     let mut status_counts: HashMap<u16, u64> = HashMap::new();
     // (path or message-prefix) → error count
     let mut error_path_counts: HashMap<String, u32> = HashMap::new();
+    // (path or message-prefix) → up to 10 raw log lines for that error pattern
+    let mut error_path_samples: HashMap<String, Vec<String>> = HashMap::new();
     // path → collected latency samples for p99 computation
     let mut latency_samples: HashMap<String, Vec<f64>> = HashMap::new();
 
@@ -72,6 +98,8 @@ pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
     let mut ip_auth_failures: HashMap<String, u32> = HashMap::new();
     // IPs that made at least one request with a traversal path pattern.
     let mut ip_traversal: HashSet<String> = HashSet::new();
+    // Up to 10 raw log lines per IP (for suspicious IP evidence).
+    let mut ip_samples: HashMap<String, Vec<String>> = HashMap::new();
 
     for record in &records {
         match record {
@@ -80,6 +108,10 @@ pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
 
                 if r.status >= 400 {
                     *error_path_counts.entry(r.path.clone()).or_insert(0) += 1;
+                    let samples = error_path_samples.entry(r.path.clone()).or_default();
+                    if samples.len() < 10 {
+                        samples.push(r.raw.clone());
+                    }
                 }
 
                 // Apache Combined Log Format carries no latency field;
@@ -87,6 +119,10 @@ pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
 
                 // Suspicious-IP heuristics — Apache records carry a typed `ip` field.
                 *ip_total.entry(r.ip.clone()).or_insert(0) += 1;
+                let ip_s = ip_samples.entry(r.ip.clone()).or_default();
+                if ip_s.len() < 10 {
+                    ip_s.push(r.raw.clone());
+                }
 
                 if r.status == 401 {
                     *ip_auth_failures.entry(r.ip.clone()).or_insert(0) += 1;
@@ -117,7 +153,11 @@ pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
                                     .map(|v| v.chars().take(60).collect())
                                     .unwrap_or_default()
                             });
-                        *error_path_counts.entry(key).or_insert(0) += 1;
+                        *error_path_counts.entry(key.clone()).or_insert(0) += 1;
+                        let samples = error_path_samples.entry(key).or_default();
+                        if samples.len() < 10 {
+                            samples.push(r.raw.clone());
+                        }
                     }
                 }
 
@@ -141,6 +181,10 @@ pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
                     .find_map(|&k| r.fields.get(k))
                 {
                     *ip_total.entry(ip.clone()).or_insert(0) += 1;
+                    let ip_s = ip_samples.entry(ip.clone()).or_default();
+                    if ip_s.len() < 10 {
+                        ip_s.push(r.raw.clone());
+                    }
 
                     if status == Some(401) {
                         *ip_auth_failures.entry(ip.clone()).or_insert(0) += 1;
@@ -201,9 +245,30 @@ pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
         error_count as f64 / total as f64
     };
 
-    let mut top_errors: Vec<(String, u32)> = error_path_counts.into_iter().collect();
-    top_errors.sort_by(|a, b| b.1.cmp(&a.1));
-    top_errors.truncate(10);
+    let mut top_errors_with_counts: Vec<(String, u32)> = error_path_counts.into_iter().collect();
+    top_errors_with_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    top_errors_with_counts.truncate(10);
+
+    // Build evidence from the top error paths (in the same order as top_errors).
+    let mut evidence: Vec<ErrorEvidence> = top_errors_with_counts
+        .iter()
+        .map(|(pattern, count)| {
+            let sample_lines = error_path_samples.remove(pattern).unwrap_or_default();
+            ErrorEvidence { pattern: pattern.clone(), count: *count, sample_lines }
+        })
+        .collect();
+
+    // Also add evidence for each suspicious IP.
+    for suspicious in &suspicious_ips {
+        let sample_lines = ip_samples.remove(&suspicious.ip).unwrap_or_default();
+        evidence.push(ErrorEvidence {
+            pattern: suspicious.ip.clone(),
+            count: suspicious.request_count,
+            sample_lines,
+        });
+    }
+
+    let top_errors: Vec<(String, u32)> = top_errors_with_counts;
 
     let mut top_slow_paths: Vec<(String, f64)> = latency_samples
         .into_iter()
@@ -216,14 +281,16 @@ pub fn aggregate(records: Vec<LogRecord>) -> LogSummary {
     top_slow_paths.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     top_slow_paths.truncate(5);
 
-    LogSummary {
+    let summary = LogSummary {
         total,
         error_rate,
         status_counts,
         top_errors,
         top_slow_paths,
         suspicious_ips,
-    }
+    };
+
+    AggregatorOutput { summary, evidence }
 }
 
 #[cfg(test)]
@@ -240,6 +307,9 @@ mod tests {
     }
 
     fn apache_record_ip_path(status: u16, ip: &str, path: &str) -> LogRecord {
+        let raw = format!(
+            r#"{ip} - - [01/Jan/2026:00:00:00 +0000] "GET {path} HTTP/1.1" {status} 512 "-" "test-agent""#
+        );
         LogRecord::Apache(ApacheRecord {
             ip: ip.to_string(),
             ident: "-".to_string(),
@@ -252,6 +322,7 @@ mod tests {
             bytes: 512,
             referer: "-".to_string(),
             user_agent: "test-agent".to_string(),
+            raw,
         })
     }
 
@@ -263,9 +334,9 @@ mod tests {
             apache_record(404),
             apache_record(500),
         ];
-        let summary = aggregate(records);
-        assert_eq!(summary.total, 4);
-        assert!((summary.error_rate - 0.25).abs() < f64::EPSILON);
+        let out = aggregate(records);
+        assert_eq!(out.summary.total, 4);
+        assert!((out.summary.error_rate - 0.25).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -276,17 +347,17 @@ mod tests {
             apache_record(404),
             apache_record(500),
         ];
-        let summary = aggregate(records);
-        assert_eq!(*summary.status_counts.get(&200).unwrap(), 2);
-        assert_eq!(*summary.status_counts.get(&404).unwrap(), 1);
-        assert_eq!(*summary.status_counts.get(&500).unwrap(), 1);
+        let out = aggregate(records);
+        assert_eq!(*out.summary.status_counts.get(&200).unwrap(), 2);
+        assert_eq!(*out.summary.status_counts.get(&404).unwrap(), 1);
+        assert_eq!(*out.summary.status_counts.get(&500).unwrap(), 1);
     }
 
     #[test]
     fn empty_input_returns_zero_error_rate() {
-        let summary = aggregate(vec![]);
-        assert_eq!(summary.total, 0);
-        assert_eq!(summary.error_rate, 0.0);
+        let out = aggregate(vec![]);
+        assert_eq!(out.summary.total, 0);
+        assert_eq!(out.summary.error_rate, 0.0);
     }
 
     #[test]
@@ -297,19 +368,19 @@ mod tests {
             apache_record_path(404, "/missing"),
             apache_record_path(200, "/ok"),
         ];
-        let summary = aggregate(records);
-        assert_eq!(summary.top_errors[0].0, "/api/search");
-        assert_eq!(summary.top_errors[0].1, 2);
-        assert_eq!(summary.top_errors[1].0, "/missing");
-        assert_eq!(summary.top_errors[1].1, 1);
-        assert!(!summary.top_errors.iter().any(|(p, _)| p == "/ok"));
+        let out = aggregate(records);
+        assert_eq!(out.summary.top_errors[0].0, "/api/search");
+        assert_eq!(out.summary.top_errors[0].1, 2);
+        assert_eq!(out.summary.top_errors[1].0, "/missing");
+        assert_eq!(out.summary.top_errors[1].1, 1);
+        assert!(!out.summary.top_errors.iter().any(|(p, _)| p == "/ok"));
     }
 
     #[test]
     fn apache_logs_have_no_slow_paths() {
         let records = vec![apache_record(200), apache_record(500)];
-        let summary = aggregate(records);
-        assert!(summary.top_slow_paths.is_empty());
+        let out = aggregate(records);
+        assert!(out.summary.top_slow_paths.is_empty());
     }
 
     #[test]
@@ -318,11 +389,11 @@ mod tests {
             apache_record_ip_path(400, "10.0.0.99", "/../../../../etc/passwd"),
             apache_record_ip_path(200, "192.168.1.10", "/index.html"),
         ];
-        let summary = aggregate(records);
-        assert_eq!(summary.suspicious_ips.len(), 1);
-        assert_eq!(summary.suspicious_ips[0].ip, "10.0.0.99");
-        assert!(summary.suspicious_ips[0].reason.contains("path traversal"));
-        assert_eq!(summary.suspicious_ips[0].request_count, 1);
+        let out = aggregate(records);
+        assert_eq!(out.summary.suspicious_ips.len(), 1);
+        assert_eq!(out.summary.suspicious_ips[0].ip, "10.0.0.99");
+        assert!(out.summary.suspicious_ips[0].reason.contains("path traversal"));
+        assert_eq!(out.summary.suspicious_ips[0].request_count, 1);
     }
 
     #[test]
@@ -333,11 +404,11 @@ mod tests {
             apache_record_ip_path(401, "10.0.0.5", "/admin/login"),
             apache_record_ip_path(200, "192.168.1.22", "/index.html"),
         ];
-        let summary = aggregate(records);
-        assert_eq!(summary.suspicious_ips.len(), 1);
-        assert_eq!(summary.suspicious_ips[0].ip, "10.0.0.5");
-        assert!(summary.suspicious_ips[0].reason.contains("repeated auth failures"));
-        assert_eq!(summary.suspicious_ips[0].request_count, 3);
+        let out = aggregate(records);
+        assert_eq!(out.summary.suspicious_ips.len(), 1);
+        assert_eq!(out.summary.suspicious_ips[0].ip, "10.0.0.5");
+        assert!(out.summary.suspicious_ips[0].reason.contains("repeated auth failures"));
+        assert_eq!(out.summary.suspicious_ips[0].request_count, 3);
     }
 
     #[test]
@@ -348,8 +419,8 @@ mod tests {
             apache_record_ip_path(401, "10.0.0.5", "/api/auth"),
             apache_record_ip_path(200, "10.0.0.5", "/index.html"),
         ];
-        let summary = aggregate(records);
-        assert!(summary.suspicious_ips.is_empty());
+        let out = aggregate(records);
+        assert!(out.summary.suspicious_ips.is_empty());
     }
 
     #[test]
@@ -359,7 +430,7 @@ mod tests {
             apache_record_ip_path(200, "192.168.1.22", "/api/data"),
             apache_record_ip_path(404, "192.168.1.31", "/missing"),
         ];
-        let summary = aggregate(records);
-        assert!(summary.suspicious_ips.is_empty());
+        let out = aggregate(records);
+        assert!(out.summary.suspicious_ips.is_empty());
     }
 }

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
-use crate::aggregator::{aggregate, LogSummary};
+use crate::aggregator::{aggregate, AggregatorOutput, LogSummary};
 use crate::ai::{AnalysisEngine, AnalysisResult, Message};
 use crate::parser::ai_infer::AiInferredParser;
 use crate::parser::apache::ApacheParser;
@@ -128,8 +128,24 @@ async fn summary_handler(
     State(state): State<AppState>,
     Query(params): Query<SummaryQuery>,
 ) -> Result<Json<SummaryResponse>, AppError> {
-    let summary = parse_file_to_summary(&params.file).await?;
-    let analysis = state.engine.analyse(&summary).await?;
+    let out = parse_file_to_aggregator_output(&params.file).await?;
+    let summary = out.summary;
+    let mut analysis = state.engine.analyse(&summary).await?;
+
+    // ── Join evidence to issues (post-LLM, zero extra API cost) ──────────
+    // Match each issue to evidence whose pattern appears in the issue title
+    // or explanation. Multiple evidence entries can match a single issue.
+    for issue in &mut analysis.issues {
+        let needle = format!("{} {}", issue.title, issue.explanation).to_lowercase();
+        for ev in &out.evidence {
+            if needle.contains(&ev.pattern.to_lowercase()) {
+                issue.evidence.extend(ev.sample_lines.iter().cloned());
+                // Cap at 5 lines per issue to keep the response compact.
+                issue.evidence.truncate(5);
+                break;
+            }
+        }
+    }
 
     // Persist the result; a store failure does not fail the HTTP response.
     if let Err(e) = state.store.save(&params.file, &summary, &analysis).await {
@@ -170,7 +186,7 @@ async fn get_result_handler(
 // Shared pipeline helper
 // ---------------------------------------------------------------------------
 
-async fn parse_file_to_summary(path: &str) -> Result<LogSummary> {
+async fn parse_file_to_aggregator_output(path: &str) -> Result<AggregatorOutput> {
     let file = File::open(path)?;
 
     let lines: Vec<String> = BufReader::new(file)

@@ -101,7 +101,7 @@ impl Parser for AiInferredParser {
             }
         }
 
-        Ok(LogRecord::Inferred(InferredRecord { fields }))
+        Ok(LogRecord::Inferred(InferredRecord { fields, raw: line.to_string() }))
     }
 }
 

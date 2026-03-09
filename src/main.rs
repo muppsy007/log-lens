@@ -171,7 +171,8 @@ async fn run_analysis(file_path: &str) -> Result<()> {
     // 4. Aggregate
     // -----------------------------------------------------------------------
 
-    let summary = aggregate(records);
+    let out = aggregate(records);
+    let summary = out.summary;
     let summary_json = to_json(&summary)?;
 
     println!("{}", format!("Analysing {} log records…", summary.total).bold());

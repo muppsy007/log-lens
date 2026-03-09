@@ -59,6 +59,7 @@ impl Parser for ApacheParser {
             bytes,
             referer: caps["referer"].to_string(),
             user_agent: caps["user_agent"].to_string(),
+            raw: line.to_string(),
         }))
     }
 }

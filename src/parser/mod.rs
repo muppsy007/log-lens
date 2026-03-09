@@ -46,6 +46,9 @@ pub struct ApacheRecord {
     pub bytes: u64,
     pub referer: String,
     pub user_agent: String,
+    /// The original unparsed log line, preserved so the aggregator can surface
+    /// representative sample lines in triage output without a second file read.
+    pub raw: String,
 }
 
 /// A record produced by the AI-inferred parser.
@@ -56,6 +59,8 @@ pub struct ApacheRecord {
 #[derive(Debug, Serialize)]
 pub struct InferredRecord {
     pub fields: HashMap<String, String>,
+    /// The original unparsed log line, preserved for evidence sampling.
+    pub raw: String,
 }
 
 /// The core parsing contract every format adapter must fulfil.
