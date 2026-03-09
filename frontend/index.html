@@ -341,6 +341,56 @@
       letter-spacing: 0.06em;
     }
 
+    /* ── Progress log ───────────────────────────────────────────────────── */
+    #progress-log {
+      display: none;
+      flex-direction: column;
+      gap: 7px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      font-family: 'SFMono-Regular', Consolas, monospace;
+      font-size: 0.85rem;
+    }
+    #progress-log.visible { display: flex; }
+
+    .progress-entry {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      animation: fadeIn 0.18s ease;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-3px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .progress-icon {
+      flex-shrink: 0;
+      width: 16px;
+      text-align: center;
+      line-height: 1;
+    }
+    .progress-icon.done  { color: var(--green); }
+    .progress-icon.fail  { color: var(--red); }
+    /* Spinner state — overrides width/height to match the border-circle size */
+    .progress-icon.spinning {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+    }
+
+    .progress-text {
+      color: var(--muted);
+    }
+    .progress-entry.current .progress-text { color: var(--text); }
+
     /* ── Chart ─────────────────────────────────────────────────────────── */
     .chart-wrap {
       position: relative;
@@ -391,11 +441,14 @@
       <button id="submit-btn" onclick="analyse()">Analyse</button>
     </div>
 
-    <!-- ── Loading indicator ───────────────────────────────────────────── -->
+    <!-- ── Loading indicator (used by history dropdown only) ──────────── -->
     <div class="loading" id="loading">
       <div class="spinner"></div>
-      <span>Analysing log file…</span>
+      <span>Loading…</span>
     </div>
+
+    <!-- ── SSE progress log ─────────────────────────────────────────────── -->
+    <div id="progress-log"></div>
 
     <!-- ── Error display ───────────────────────────────────────────────── -->
     <div class="error-box" id="error-box"></div>
@@ -516,54 +569,103 @@
     // Populate the dropdown as soon as the page loads.
     loadHistory();
 
+    /* ── Progress log helpers ─────────────────────────────────────────── */
+
+    let _currentEntry = null;  // the last appended (currently spinning) entry
+
+    function progressLogStart() {
+      const log = document.getElementById('progress-log');
+      log.innerHTML = '';
+      log.classList.add('visible');
+      _currentEntry = null;
+    }
+
+    function progressLogHide() {
+      document.getElementById('progress-log').classList.remove('visible');
+    }
+
+    // Appends a new spinning entry and marks the previous one done (✓).
+    function progressLogAppend(message) {
+      if (_currentEntry) _progressMarkDone(_currentEntry);
+
+      const entry = document.createElement('div');
+      entry.className = 'progress-entry current';
+
+      const icon = document.createElement('span');
+      icon.className = 'progress-icon spinning';
+
+      const text = document.createElement('span');
+      text.className = 'progress-text';
+      text.textContent = message;
+
+      entry.appendChild(icon);
+      entry.appendChild(text);
+      document.getElementById('progress-log').appendChild(entry);
+      _currentEntry = entry;
+    }
+
+    function _progressMarkDone(entry) {
+      entry.classList.remove('current');
+      const icon = entry.querySelector('.progress-icon');
+      icon.className = 'progress-icon done';
+      icon.textContent = '✓';
+    }
+
+    function _progressMarkFail(entry) {
+      entry.classList.remove('current');
+      const icon = entry.querySelector('.progress-icon');
+      icon.className = 'progress-icon fail';
+      icon.textContent = '✗';
+    }
+
     /* ── Main action ──────────────────────────────────────────────────── */
 
-    async function analyse() {
+    function analyse() {
       const path = document.getElementById('file-input').value.trim();
       if (!path) return;
 
-      setLoading(true);
+      document.getElementById('submit-btn').disabled = true;
       clearError();
       hideResults();
+      progressLogStart();
+      progressLogAppend('Connecting…');
 
-      try {
-        /*
-          encodeURIComponent converts '/' → '%2F' so path separators survive
-          the query string intact. Axum's Query extractor percent-decodes the
-          value before handing it to the handler, so the server sees the
-          original path with real slashes.
-        */
-        const url = `/api/summary?file=${encodeURIComponent(path)}`;
-        const res = await fetch(url);
+      const url = `/api/summary?file=${encodeURIComponent(path)}`;
+      const es = new EventSource(url);
 
-        if (!res.ok) {
-          /*
-            Read the plain-text body the server sends on error (AppError
-            returns the anyhow message as the body, not JSON).
-          */
-          const msg = await res.text();
-          throw new Error(`Server returned ${res.status}: ${msg}`);
+      es.addEventListener('progress', (e) => {
+        const { message } = JSON.parse(e.data);
+        progressLogAppend(message);
+      });
+
+      es.addEventListener('complete', (e) => {
+        es.close();
+        // Mark the last stage done, then give the user 300 ms to see it
+        // before the log disappears and results render.
+        if (_currentEntry) _progressMarkDone(_currentEntry);
+        setTimeout(() => {
+          progressLogHide();
+          document.getElementById('submit-btn').disabled = false;
+          const data = JSON.parse(e.data);
+          render({ summary: data.summary, analysis: data.analysis });
+          loadHistory().then(() => {
+            const sel = document.getElementById('history-select');
+            if (sel.options.length > 1) sel.value = sel.options[1].value;
+          });
+        }, 300);
+      });
+
+      es.addEventListener('error', (e) => {
+        es.close();
+        if (_currentEntry) _progressMarkFail(_currentEntry);
+        document.getElementById('submit-btn').disabled = false;
+        if (e.data) {
+          const { message } = JSON.parse(e.data);
+          showError(message);
+        } else {
+          showError('Connection to server lost.');
         }
-
-        const data = await res.json();
-        render(data);
-
-        // Refresh the history dropdown and auto-select the newest entry.
-        // Because the list is ordered newest-first, the first non-placeholder
-        // option is always the result we just saved.
-        await loadHistory();
-        const sel = document.getElementById('history-select');
-        if (sel.options.length > 1) sel.value = sel.options[1].value;
-
-      } catch (err) {
-        showError(err.message);
-      } finally {
-        /*
-          `finally` runs whether the fetch succeeded or failed, so the
-          button is always re-enabled — no way to get stuck in loading state.
-        */
-        setLoading(false);
-      }
+      });
     }
 
     /* ── Render ───────────────────────────────────────────────────────── */
@@ -769,9 +871,9 @@
 
     /* ── UI state helpers ─────────────────────────────────────────────── */
 
+    // Used by the history dropdown only.
     function setLoading(on) {
       document.getElementById('loading').classList.toggle('visible', on);
-      // Disable the button while loading to prevent duplicate submissions.
       document.getElementById('submit-btn').disabled = on;
     }
 
