@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 anyhow = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

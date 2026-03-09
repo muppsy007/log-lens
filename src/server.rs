@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
@@ -6,11 +7,14 @@ use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -25,11 +29,6 @@ use crate::store::{ResultStore, StoredResult};
 // Shared application state
 // ---------------------------------------------------------------------------
 
-/// All shared state passed to every Axum handler.
-///
-/// Both fields are `Clone`:
-/// - `Arc<dyn AnalysisEngine>` clones cheaply (reference-counted pointer).
-/// - `ResultStore` clones cheaply (`SqlitePool` is internally `Arc`-backed).
 #[derive(Clone)]
 struct AppState {
     engine: Arc<dyn AnalysisEngine>,
@@ -37,18 +36,12 @@ struct AppState {
 }
 
 // ---------------------------------------------------------------------------
-// Wire types — only used for HTTP request/response bodies
+// Wire types
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct SummaryQuery {
     file: String,
-}
-
-#[derive(Serialize)]
-struct SummaryResponse {
-    summary: LogSummary,
-    analysis: AnalysisResult,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +58,39 @@ struct ChatResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Error handling
+// SSE event helpers
+// ---------------------------------------------------------------------------
+
+/// Builds a progress event (stage + message) for SSE.
+fn progress(stage: &str, message: impl Into<String>) -> Event {
+    let data = serde_json::json!({ "stage": stage, "message": message.into() });
+    Event::default()
+        .event("progress")
+        .data(data.to_string())
+}
+
+/// Builds the terminal "complete" event carrying the full result payload.
+fn complete_event(summary: &LogSummary, analysis: &AnalysisResult) -> Event {
+    let data = serde_json::json!({
+        "stage": "complete",
+        "summary": summary,
+        "analysis": analysis,
+    });
+    Event::default()
+        .event("complete")
+        .data(data.to_string())
+}
+
+/// Builds an error event. After sending this the pipeline task exits.
+fn error_event(message: impl Into<String>) -> Event {
+    let data = serde_json::json!({ "stage": "error", "message": message.into() });
+    Event::default()
+        .event("error")
+        .data(data.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Error handling (used by chat/results handlers only)
 // ---------------------------------------------------------------------------
 
 struct AppError(anyhow::Error);
@@ -86,10 +111,6 @@ impl From<anyhow::Error> for AppError {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Constructs the Axum router with all routes and shared state.
-///
-/// Accepts a concrete `ResultStore` (not boxed) because `ResultStore` is a
-/// concrete type whose `Clone` impl is cheap — no trait object needed.
 pub fn build_router(engine: Box<dyn AnalysisEngine>, store: ResultStore) -> Router {
     let state = AppState {
         engine: Arc::from(engine),
@@ -106,7 +127,6 @@ pub fn build_router(engine: Box<dyn AnalysisEngine>, store: ResultStore) -> Rout
         .layer(CorsLayer::permissive())
 }
 
-/// Starts the Axum HTTP server, opening (or creating) the result store first.
 pub async fn start_server(engine: Box<dyn AnalysisEngine>, host: &str, port: u16) -> Result<()> {
     let db_path = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite:./log_lens.db".to_string());
@@ -124,35 +144,69 @@ pub async fn start_server(engine: Box<dyn AnalysisEngine>, host: &str, port: u16
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Streams the full analysis pipeline as SSE progress events, ending with a
+/// "complete" event that carries the full `SummaryResponse` payload.
 async fn summary_handler(
     State(state): State<AppState>,
     Query(params): Query<SummaryQuery>,
-) -> Result<Json<SummaryResponse>, AppError> {
-    let out = parse_file_to_aggregator_output(&params.file).await?;
-    let summary = out.summary;
-    let mut analysis = state.engine.analyse(&summary).await?;
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel::<Event>(16);
+    let stream = ReceiverStream::new(rx).map(Ok::<Event, Infallible>);
 
-    // ── Join evidence to issues (post-LLM, zero extra API cost) ──────────
-    // Match each issue to evidence whose pattern appears in the issue title
-    // or explanation. Multiple evidence entries can match a single issue.
-    for issue in &mut analysis.issues {
-        let needle = format!("{} {}", issue.title, issue.explanation).to_lowercase();
-        for ev in &out.evidence {
-            if needle.contains(&ev.pattern.to_lowercase()) {
-                issue.evidence.extend(ev.sample_lines.iter().cloned());
-                // Cap at 5 lines per issue to keep the response compact.
-                issue.evidence.truncate(5);
-                break;
+    tokio::spawn(async move {
+        macro_rules! send {
+            ($evt:expr) => {
+                // Ignore send errors — client may have disconnected.
+                let _ = tx.send($evt).await;
+            };
+        }
+
+        // Stage 1 — reading
+        send!(progress("reading", format!("Reading log file: {}", params.file)));
+
+        let out = match parse_file_to_aggregator_output(&params.file, &tx).await {
+            Ok(o) => o,
+            Err(e) => {
+                send!(error_event(e.to_string()));
+                return;
+            }
+        };
+
+        let summary = out.summary;
+
+        // Stage 7 — analysing
+        send!(progress("analysing", "Sending summary to LLM for analysis"));
+
+        let mut analysis = match state.engine.analyse(&summary).await {
+            Ok(a) => a,
+            Err(e) => {
+                send!(error_event(e.to_string()));
+                return;
+            }
+        };
+
+        // Join evidence to issues post-LLM.
+        for issue in &mut analysis.issues {
+            let needle = format!("{} {}", issue.title, issue.explanation).to_lowercase();
+            for ev in &out.evidence {
+                if needle.contains(&ev.pattern.to_lowercase()) {
+                    issue.evidence.extend(ev.sample_lines.iter().cloned());
+                    issue.evidence.truncate(5);
+                    break;
+                }
             }
         }
-    }
 
-    // Persist the result; a store failure does not fail the HTTP response.
-    if let Err(e) = state.store.save(&params.file, &summary, &analysis).await {
-        eprintln!("[warn] store.save failed: {e}");
-    }
+        if let Err(e) = state.store.save(&params.file, &summary, &analysis).await {
+            eprintln!("[warn] store.save failed: {e}");
+        }
 
-    Ok(Json(SummaryResponse { summary, analysis }))
+        // Stage 8 — complete
+        send!(complete_event(&summary, &analysis));
+        // tx dropped here → stream closes
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn chat_handler(
@@ -163,7 +217,6 @@ async fn chat_handler(
     Ok(Json(ChatResponse { answer }))
 }
 
-/// Returns all stored results as a JSON array, newest first.
 async fn list_results_handler(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<StoredResult>>, AppError> {
@@ -171,7 +224,6 @@ async fn list_results_handler(
     Ok(Json(results))
 }
 
-/// Returns a single stored result by ID, or 404 if not found.
 async fn get_result_handler(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -183,15 +235,24 @@ async fn get_result_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Shared pipeline helper
+// Pipeline helper — emits progress events at each stage
 // ---------------------------------------------------------------------------
 
-async fn parse_file_to_aggregator_output(path: &str) -> Result<AggregatorOutput> {
-    let file = File::open(path)?;
+async fn parse_file_to_aggregator_output(
+    path: &str,
+    tx: &mpsc::Sender<Event>,
+) -> Result<AggregatorOutput> {
+    macro_rules! send {
+        ($evt:expr) => { let _ = tx.send($evt).await; };
+    }
 
+    let file = File::open(path)?;
     let lines: Vec<String> = BufReader::new(file)
         .lines()
         .collect::<std::io::Result<Vec<_>>>()?;
+
+    // Stage 2 — detecting
+    send!(progress("detecting", "Sampling lines for format detection"));
 
     let sample: Vec<&str> = lines
         .iter()
@@ -207,18 +268,45 @@ async fn parse_file_to_aggregator_output(path: &str) -> Result<AggregatorOutput>
     let apache_parser = ApacheParser::new()?;
     let tier2 = &sample[..sample.len().min(5)];
     let hits = tier2.iter().filter(|l| apache_parser.parse(l).is_ok()).count();
+    let use_apache = hits * 2 >= tier2.len();
 
-    let parser: Box<dyn Parser> = if hits * 2 >= tier2.len() {
-        Box::new(apache_parser)
+    // Stage 3 — emit format detection result.
+    // Resolve the inferred parser (if needed) while holding only Send-safe
+    // concrete types. Box<dyn Parser> is not Send so must not be held across
+    // any await point; create it only inside the synchronous record-collection
+    // block below.
+    let inferred_parser: Option<AiInferredParser> = if use_apache {
+        send!(progress("format_known", "Apache access log detected"));
+        None
     } else {
-        Box::new(AiInferredParser::new(&sample).await?)
+        send!(progress("format_unknown", "Unknown format — asking LLM to infer schema"));
+        let p = AiInferredParser::new(&sample).await?;
+        // Stage 4 — schema ready (cache hit or miss handled inside the parser).
+        send!(progress("cached", "Schema inferred and cached for future use"));
+        Some(p)
     };
 
-    let records = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| parser.parse(l).ok())
-        .collect();
+    // Stage 5 — parsing
+    let n = lines.iter().filter(|l| !l.trim().is_empty()).count();
+    send!(progress("parsing", format!("Parsing {n} log records")));
+
+    // Collect records synchronously — no await inside this block so
+    // Box<dyn Parser> does not need to be Send.
+    let records = {
+        let parser: Box<dyn Parser> = match inferred_parser {
+            Some(p) => Box::new(p),
+            None => Box::new(apache_parser),
+        };
+        lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| parser.parse(l).ok())
+            .collect::<Vec<_>>()
+        // parser dropped here, before any further await
+    };
+
+    // Stage 6 — aggregating
+    send!(progress("aggregating", "Aggregating statistics"));
 
     Ok(aggregate(records))
 }
@@ -242,12 +330,34 @@ mod tests {
         body.collect().await.expect("body must be readable").to_bytes()
     }
 
-    /// Creates an in-memory SQLite store suitable for tests.
-    /// `:memory:` is per-connection, so each test gets a clean slate.
     async fn test_store() -> ResultStore {
         ResultStore::new("sqlite::memory:")
             .await
             .expect("in-memory store must succeed")
+    }
+
+    /// Extracts the JSON payload from the "complete" SSE event in an SSE body.
+    ///
+    /// SSE frames are separated by blank lines. Each frame has one or more
+    /// `field: value` lines. We find the frame whose `event:` line is
+    /// "complete" and return the `data:` value.
+    fn extract_complete_event(body: &str) -> serde_json::Value {
+        // Split into frames on blank lines.
+        for frame in body.split("\n\n") {
+            let mut event_type = "";
+            let mut data = "";
+            for line in frame.lines() {
+                if let Some(v) = line.strip_prefix("event:") {
+                    event_type = v.trim();
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data = v.trim();
+                }
+            }
+            if event_type == "complete" && !data.is_empty() {
+                return serde_json::from_str(data).expect("complete event data must be valid JSON");
+            }
+        }
+        panic!("no 'complete' event found in SSE body:\n{body}");
     }
 
     #[tokio::test]
@@ -267,11 +377,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let bytes = body_bytes(response.into_body()).await;
-        let json: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be valid JSON");
+        let body_str = std::str::from_utf8(&bytes).expect("body must be UTF-8");
+        let json = extract_complete_event(body_str);
 
-        assert!(json.get("summary").is_some(), "response must have 'summary' field");
-        assert!(json.get("analysis").is_some(), "response must have 'analysis' field");
+        assert!(json.get("summary").is_some(), "complete event must have 'summary'");
+        assert!(json.get("analysis").is_some(), "complete event must have 'analysis'");
 
         let issues = json["analysis"]["issues"]
             .as_array()
