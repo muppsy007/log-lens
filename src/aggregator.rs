@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, DisplayFromStr};
 
 use crate::parser::LogRecord;
 
@@ -45,6 +46,7 @@ pub struct SuspiciousIp {
 /// The statistical summary produced from a batch of parsed log records.
 /// Kept as a plain data struct (not an iterator/stream) so it can be serialised
 /// to JSON, stored, or handed to the AI layer without further transformation.
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSummary {
     /// Total number of records in the batch.
@@ -55,6 +57,7 @@ pub struct LogSummary {
     /// server-side failures rather than normal 404/401 traffic.
     pub error_rate: f64,
     /// Count of records grouped by HTTP status code.
+    #[serde_as(as = "HashMap<DisplayFromStr, _>")]
     pub status_counts: HashMap<u16, u64>,
     /// Top 10 error paths by frequency (path/message-prefix, count).
     /// Grouped by request path when available; otherwise by the first 60

@@ -639,17 +639,32 @@
           container.appendChild(card);
         }
       } else if (analysis.raw) {
-        // LLM returned prose instead of JSON — show it labelled.
-        const box = document.createElement('div');
-        box.className = 'raw-fallback';
-        const label = document.createElement('div');
-        label.className = 'raw-fallback-label';
-        label.textContent = 'Unstructured response';
-        const body = document.createElement('div');
-        body.textContent = analysis.raw;
-        box.appendChild(label);
-        box.appendChild(body);
-        container.appendChild(box);
+        // The server couldn't parse the LLM response as AnalysisResult, but
+        // the raw string may still be valid JSON with an issues array — try
+        // parsing it before falling back to the plain-text display.
+        let parsed = null;
+        try {
+          const cleaned = analysis.raw
+            .replace(/^```json\s*/i, '')
+            .replace(/```\s*$/, '')
+            .trim();
+          parsed = JSON.parse(cleaned);
+        } catch (_) {}
+
+        if (parsed && Array.isArray(parsed.issues) && parsed.issues.length > 0) {
+          renderIssues({ issues: parsed.issues });
+        } else {
+          const box = document.createElement('div');
+          box.className = 'raw-fallback';
+          const label = document.createElement('div');
+          label.className = 'raw-fallback-label';
+          label.textContent = 'Unstructured response';
+          const body = document.createElement('div');
+          body.textContent = analysis.raw;
+          box.appendChild(label);
+          box.appendChild(body);
+          container.appendChild(box);
+        }
       } else {
         // Both empty — positive confirmation that the log is clean.
         const msg = document.createElement('p');

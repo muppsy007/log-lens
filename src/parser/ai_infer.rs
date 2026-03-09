@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{InferredRecord, LogRecord, Parser};
@@ -13,27 +14,19 @@ use super::{InferredRecord, LogRecord, Parser};
 const MODEL: &str = "claude-sonnet-4-20250514";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// Keep the regex short so the response stays well within max_tokens.
-const MAX_TOKENS: u32 = 512;
+const MAX_TOKENS: u32 = 1024;
 
 // Static regex patterns used to compute structural shape.
-// `LazyLock` compiles them once on first access rather than on every call;
-// regex compilation is expensive (~microseconds) and would be a measurable
-// cost when processing millions of lines.
 static RE_TS_APACHE: LazyLock<Regex> = LazyLock::new(|| {
-    // Apache Combined Log Format timestamp: 07/Mar/2026:09:12:03 -0500
     Regex::new(r"\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4}").unwrap()
 });
 
 static RE_TS_ISO: LazyLock<Regex> = LazyLock::new(|| {
-    // ISO 8601 / RFC 3339 timestamps with optional fractional seconds and timezone:
-    // 2026-03-07T09:12:03, 2026-03-07 09:12:03, 2026-03-07T09:12:03.456+12:00
     Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
         .unwrap()
 });
 
 static RE_TS_SYSLOG: LazyLock<Regex> = LazyLock::new(|| {
-    // Syslog timestamp: Mar  7 09:12:03
     Regex::new(r"[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}").unwrap()
 });
 
@@ -42,45 +35,72 @@ static RE_NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").unwrap()
 static RE_WORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z]+").unwrap());
 
-/// Parses log lines using an LLM-inferred regex.
+// ---------------------------------------------------------------------------
+// Parse strategy
+// ---------------------------------------------------------------------------
+
+/// Full parsing strategy returned by the LLM and stored in the cache.
 ///
-/// `new()` is async because constructing the parser may involve an HTTP call
-/// to the Anthropic API on a cache miss. Once built, `parse()` is fully
-/// synchronous — the regex is compiled and ready.
+/// Separating the regex from the context-field metadata means the parser can
+/// apply a two-phase approach: outer regex captures all fields (including any
+/// embedded JSON blob as a raw string), then optionally parses that blob to
+/// merge its keys into the record's field map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ParseStrategy {
+    outer_regex: String,
+    context_field: Option<String>,
+    parse_context_as_json: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Parser struct and impl
+// ---------------------------------------------------------------------------
+
+/// Parses log lines using an LLM-inferred two-phase strategy.
+///
+/// Phase 1: the outer regex captures all fields, treating embedded JSON blobs
+///          as opaque strings via a permissive capture group.
+/// Phase 2 (optional): parse the captured blob as JSON and merge its keys
+///          into the record field map, never failing the line on blob errors.
 pub struct AiInferredParser {
     re: Regex,
+    context_field: Option<String>,
+    parse_context_as_json: bool,
 }
 
 impl AiInferredParser {
     /// Constructs a parser for the given sample lines.
     ///
-    /// On cache hit the regex is loaded from disk and compiled with no API call.
-    /// On cache miss the LLM is queried once, the regex is cached, then compiled.
+    /// On cache hit the strategy is loaded from disk with no API call.
+    /// On cache miss the LLM is queried once, the strategy is cached, then used.
     pub async fn new(sample_lines: &[&str]) -> Result<Self> {
         let shape = structural_shape(sample_lines);
         let cache_key = sha256_hex(&shape);
 
         let cache = load_cache()?;
 
-        let regex_str = if let Some(cached) = cache.get(&cache_key) {
+        let strategy = if let Some(cached) = cache.get(&cache_key) {
             cached.clone()
         } else {
-            let regex_str = infer_regex_from_llm(sample_lines).await?;
-            // Re-load to avoid losing any writes that happened while we were
-            // awaiting the LLM response (shouldn't matter for a single-user
-            // CLI, but is a good habit for any cache write path).
+            let strategy = infer_strategy_from_llm(sample_lines).await?;
             let mut fresh_cache = load_cache()?;
-            fresh_cache.insert(cache_key, regex_str.clone());
+            fresh_cache.insert(cache_key, strategy.clone());
             save_cache(&fresh_cache)?;
-            regex_str
+            strategy
         };
 
-        // Fail fast here rather than on the first `parse()` call — a bad
-        // regex from the LLM surfaces immediately at construction time.
-        let re = Regex::new(&regex_str)
-            .map_err(|e| anyhow!("LLM-returned regex failed to compile: {e}\nRegex was: {regex_str}"))?;
+        let re = Regex::new(&strategy.outer_regex).map_err(|e| {
+            anyhow!(
+                "LLM-returned regex failed to compile: {e}\nRegex was: {}",
+                strategy.outer_regex
+            )
+        })?;
 
-        Ok(Self { re })
+        Ok(Self {
+            re,
+            context_field: strategy.context_field,
+            parse_context_as_json: strategy.parse_context_as_json,
+        })
     }
 }
 
@@ -91,13 +111,31 @@ impl Parser for AiInferredParser {
             .captures(line)
             .ok_or_else(|| anyhow!("line does not match inferred format: {:?}", line))?;
 
-        // `capture_names()` iterates over all group names in pattern order.
-        // It yields `Option<&str>` — `None` for unnamed/positional groups —
-        // so `.flatten()` skips those and leaves only named capture group names.
         let mut fields = HashMap::new();
         for name in self.re.capture_names().flatten() {
             if let Some(m) = caps.name(name) {
                 fields.insert(name.to_string(), m.as_str().to_string());
+            }
+        }
+
+        // Phase 2: if the strategy identified a JSON blob field, attempt to
+        // parse it and merge its keys. Failure is non-fatal — the raw string
+        // value is kept and the line parse succeeds regardless.
+        if self.parse_context_as_json {
+            if let Some(ref ctx_field) = self.context_field {
+                if let Some(raw_ctx) = fields.get(ctx_field).cloned() {
+                    if let Ok(obj) =
+                        serde_json::from_str::<HashMap<String, serde_json::Value>>(&raw_ctx)
+                    {
+                        for (k, v) in obj {
+                            let s = match v {
+                                serde_json::Value::String(s) => s,
+                                other => other.to_string(),
+                            };
+                            fields.insert(k, s);
+                        }
+                    }
+                }
             }
         }
 
@@ -117,30 +155,16 @@ pub fn structural_shape(lines: &[&str]) -> String {
     lines
         .iter()
         .map(|line| shape_line(line))
-        // Join with newline so the shape captures inter-line structure too.
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 fn shape_line(line: &str) -> String {
-    // Timestamps must be replaced before numbers/words: "07/Mar/2026:09:12:03"
-    // contains both digits and alphabetic chars; replacing timestamps first
-    // prevents "Mar" from becoming "W" before the Apache pattern can match it.
-    //
-    // Intermediate placeholders use non-printable ASCII control characters
-    // (below 0x20) so that RE_NUMBER (`\d+`) and RE_WORD (`[A-Za-z]+`) cannot
-    // accidentally match and overwrite a token that was just written by an
-    // earlier pass. The final `.replace()` calls swap them for the readable
-    // single-letter tokens that form the structural key.
     let s = RE_TS_APACHE.replace_all(line, "\x01");
     let s = RE_TS_ISO.replace_all(&s, "\x01");
     let s = RE_TS_SYSLOG.replace_all(&s, "\x01");
-    // Numbers after timestamps so digits already consumed by \x01 are not re-matched.
     let s = RE_NUMBER.replace_all(&s, "\x02");
-    // Words last — at this point only punctuation, spaces, and the \x01/\x02 tokens remain.
     let s = RE_WORD.replace_all(&s, "\x03");
-    // `to_string()` on the final `Cow<str>` materialises an owned String before
-    // the chained `.replace()` calls (which operate on `&str`, not `Cow`).
     s.to_string()
         .replace('\x01', "T")
         .replace('\x02', "N")
@@ -154,8 +178,6 @@ fn shape_line(line: &str) -> String {
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    // `finalize()` returns `GenericArray<u8, U32>`; collect each byte as a
-    // zero-padded 2-char hex string so the output is always 64 characters.
     hasher
         .finalize()
         .iter()
@@ -173,29 +195,25 @@ fn cache_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/log-lens/schemas.json"))
 }
 
-/// Reads the cache file at `path`, returning an empty map if the file does not exist.
-/// Separated from `load_cache` so tests can provide a temp path without env-var tricks.
-pub(crate) fn load_cache_from(path: &Path) -> Result<HashMap<String, String>> {
+/// Reads the cache file at `path`, returning an empty map if the file does not
+/// exist or cannot be parsed (e.g. old single-regex format on disk).
+pub(crate) fn load_cache_from(path: &Path) -> Result<HashMap<String, ParseStrategy>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
     let content = fs::read_to_string(path)?;
-    // Propagate a JSON parse error rather than silently returning an empty map,
-    // so a corrupted cache file is visible rather than causing repeated LLM calls.
-    Ok(serde_json::from_str(&content)?)
+    // Return empty on parse failure so a stale/old-format cache is silently
+    // invalidated rather than causing an error on every run.
+    Ok(serde_json::from_str(&content).unwrap_or_default())
 }
 
-fn load_cache() -> Result<HashMap<String, String>> {
+fn load_cache() -> Result<HashMap<String, ParseStrategy>> {
     load_cache_from(&cache_path()?)
 }
 
 /// Writes the cache to `path`, creating parent directories as needed.
-/// Separated from `save_cache` for the same testability reason as `load_cache_from`.
-pub(crate) fn save_cache_to(path: &Path, cache: &HashMap<String, String>) -> Result<()> {
-    // `parent()` returns None only if `path` is the filesystem root, which
-    // cannot happen for our `~/.cache/…` path.
+pub(crate) fn save_cache_to(path: &Path, cache: &HashMap<String, ParseStrategy>) -> Result<()> {
     if let Some(dir) = path.parent() {
-        // `create_dir_all` is idempotent — safe to call even if the dir exists.
         fs::create_dir_all(dir)?;
     }
     let content = serde_json::to_string_pretty(cache)?;
@@ -203,7 +221,7 @@ pub(crate) fn save_cache_to(path: &Path, cache: &HashMap<String, String>) -> Res
     Ok(())
 }
 
-fn save_cache(cache: &HashMap<String, String>) -> Result<()> {
+fn save_cache(cache: &HashMap<String, ParseStrategy>) -> Result<()> {
     save_cache_to(&cache_path()?, cache)
 }
 
@@ -211,24 +229,28 @@ fn save_cache(cache: &HashMap<String, String>) -> Result<()> {
 // LLM call
 // ---------------------------------------------------------------------------
 
-async fn infer_regex_from_llm(sample_lines: &[&str]) -> Result<String> {
+async fn infer_strategy_from_llm(sample_lines: &[&str]) -> Result<ParseStrategy> {
     let api_key = env::var("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not set"))?;
 
     let sample_text = sample_lines.iter().take(20).cloned().collect::<Vec<_>>().join("\n");
 
     let prompt = format!(
-        "Here are sample lines from an unknown log format. Return ONLY a Rust \
-         regex string with named capture groups that parses these lines. \
-         No explanation, no markdown, just the raw regex.\n\n{sample_text}"
+        "Analyse these log lines and return ONLY a JSON object with no markdown:\n\
+         {{\n\
+           \"outer_regex\": \"a Rust regex with named capture groups that captures all \
+         fields, using a permissive pattern like (?P<context>\\\\{{.*\\\\}}) for any \
+         embedded JSON blob rather than trying to match its contents\",\n\
+           \"context_field\": \"name of the capture group that contains a JSON blob, \
+         or null if none\",\n\
+           \"parse_context_as_json\": true or false\n\
+         }}\n\
+         Sample lines:\n\
+         {sample_text}"
     );
 
-    // Build a fresh client — `infer_regex_from_llm` is called at most once per
-    // novel format (result is cached), so connection-pool reuse is not needed here.
     let client = reqwest::Client::new();
 
-    // `serde_json::json!` builds the request body inline without needing
-    // intermediate serialisable structs — appropriate for a one-off call.
     let body = serde_json::json!({
         "model": MODEL,
         "max_tokens": MAX_TOKENS,
@@ -255,18 +277,16 @@ async fn infer_regex_from_llm(sample_lines: &[&str]) -> Result<String> {
         .as_str()
         .ok_or_else(|| anyhow!("Anthropic API response contained no text content"))?;
 
-    // Strip any markdown fences the model might add despite the prompt.
-    // Trim leading/trailing whitespace, then strip any ``` block delimiters
-    // and an optional language tag (e.g. "regex" or "rust").
-    let cleaned = raw
-        .trim()
-        .trim_start_matches("```")
-        .trim_start_matches("regex")
-        .trim_start_matches("rust")
-        .trim_end_matches("```")
-        .trim();
+    // Use a streaming deserializer starting from the first `{` so any
+    // surrounding prose or markdown fences are ignored.
+    let start = raw
+        .find('{')
+        .ok_or_else(|| anyhow!("LLM response contained no JSON object\nRaw: {raw}"))?;
+    let mut de = serde_json::Deserializer::from_str(&raw[start..]);
+    let strategy = ParseStrategy::deserialize(&mut de)
+        .map_err(|e| anyhow!("Failed to parse LLM strategy response: {e}\nRaw: {raw}"))?;
 
-    Ok(cleaned.to_string())
+    Ok(strategy)
 }
 
 // ---------------------------------------------------------------------------
@@ -277,49 +297,114 @@ async fn infer_regex_from_llm(sample_lines: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
 
-    // A short, predictable line used to verify structural shape substitutions.
-    // Chosen to exercise all three substitution types (T, N, W) clearly.
     const SHAPE_LINE: &str = "2026-03-07T09:12:03 ERROR 127.0.0.1 404";
 
     #[test]
     fn structural_shape_substitutes_correctly() {
         let shape = structural_shape(&[SHAPE_LINE]);
-        // 2026-03-07T09:12:03 → T (ISO timestamp)
-        // ERROR               → W
-        // 127, 0, 0, 1        → N each (numbers), dots preserved
-        // 404                 → N
         assert_eq!(shape, "T W N.N.N.N N");
     }
 
     #[test]
-    fn cache_round_trip_preserves_regex() {
-        // Use a unique temp path so parallel test runs don't collide.
-        // `std::process::id()` gives the PID, which is unique per process.
+    fn cache_round_trip_preserves_strategy() {
         let tmp = std::env::temp_dir()
             .join(format!("log-lens-cache-test-{}.json", std::process::id()));
 
         let mut cache = HashMap::new();
-        // A minimal named-group regex — representative of what the LLM returns.
-        cache.insert("deadbeef".to_string(), r"(?P<msg>.+)".to_string());
+        cache.insert(
+            "deadbeef".to_string(),
+            ParseStrategy {
+                outer_regex: r"(?P<msg>.+)".to_string(),
+                context_field: Some("context".to_string()),
+                parse_context_as_json: true,
+            },
+        );
 
         save_cache_to(&tmp, &cache).expect("save must succeed");
         let loaded = load_cache_from(&tmp).expect("load must succeed");
 
-        assert_eq!(
-            loaded.get("deadbeef").map(String::as_str),
-            Some(r"(?P<msg>.+)")
-        );
+        let s = loaded.get("deadbeef").expect("key must exist");
+        assert_eq!(s.outer_regex, r"(?P<msg>.+)");
+        assert_eq!(s.context_field.as_deref(), Some("context"));
+        assert!(s.parse_context_as_json);
 
-        // Clean up — ignore errors (e.g. file already removed by another run).
         let _ = std::fs::remove_file(&tmp);
     }
 
-    // Integration tests below are marked `#[ignore]` because they make real
-    // HTTP requests to the Anthropic API and require ANTHROPIC_API_KEY to be
-    // set. Running them in CI without a key would cause false failures.
-    //
-    // Run manually:
-    //   ANTHROPIC_API_KEY=sk-ant-... cargo test -- --ignored
+    #[test]
+    fn old_format_cache_returns_empty_not_error() {
+        // A cache file written by the old single-regex format should be
+        // silently discarded rather than causing a parse error.
+        let tmp = std::env::temp_dir()
+            .join(format!("log-lens-cache-old-{}.json", std::process::id()));
+        std::fs::write(&tmp, r#"{"deadbeef": "(?P<msg>.+)"}"#)
+            .expect("write must succeed");
+
+        let loaded = load_cache_from(&tmp).expect("load must succeed");
+        assert!(loaded.is_empty(), "old format should deserialize to empty map");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn context_json_merged_into_fields() {
+        // Verify phase-2 parsing: a captured JSON blob's keys are merged into
+        // the record fields without failing the parse.
+        let strategy = ParseStrategy {
+            outer_regex: r#"(?P<level>\w+): (?P<message>[^{]+)(?P<context>\{.*\})"#.to_string(),
+            context_field: Some("context".to_string()),
+            parse_context_as_json: true,
+        };
+        let re = Regex::new(&strategy.outer_regex).unwrap();
+        let parser = AiInferredParser {
+            re,
+            context_field: strategy.context_field,
+            parse_context_as_json: strategy.parse_context_as_json,
+        };
+
+        let line = r#"ERROR: something went wrong {"code": "42", "user": "alice"}"#;
+        let record = parser.parse(line).expect("line must parse");
+        match record {
+            LogRecord::Inferred(r) => {
+                assert_eq!(r.fields.get("level").map(String::as_str), Some("ERROR"));
+                // Context JSON keys must be merged in.
+                assert_eq!(r.fields.get("code").map(String::as_str), Some("42"));
+                assert_eq!(r.fields.get("user").map(String::as_str), Some("alice"));
+            }
+            _ => panic!("expected LogRecord::Inferred"),
+        }
+    }
+
+    #[test]
+    fn malformed_context_blob_keeps_raw_string() {
+        // If the context field is not valid JSON, the line must still parse
+        // successfully and the raw string value must be retained.
+        let strategy = ParseStrategy {
+            outer_regex: r#"(?P<level>\w+): (?P<context>.*)"#.to_string(),
+            context_field: Some("context".to_string()),
+            parse_context_as_json: true,
+        };
+        let re = Regex::new(&strategy.outer_regex).unwrap();
+        let parser = AiInferredParser {
+            re,
+            context_field: strategy.context_field,
+            parse_context_as_json: strategy.parse_context_as_json,
+        };
+
+        let line = "ERROR: {not valid json at all";
+        let record = parser.parse(line).expect("line must parse despite bad context blob");
+        match record {
+            LogRecord::Inferred(r) => {
+                assert_eq!(
+                    r.fields.get("context").map(String::as_str),
+                    Some("{not valid json at all")
+                );
+            }
+            _ => panic!("expected LogRecord::Inferred"),
+        }
+    }
+
+    // Integration tests require ANTHROPIC_API_KEY — run with `cargo test -- --ignored`.
 
     #[tokio::test]
     #[ignore]
