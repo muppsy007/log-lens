@@ -113,7 +113,9 @@ impl AnalysisEngine for AnthropicEngine {
              Order issues by severity: critical first. Be specific — reference actual counts and paths from the data. Do not invent data not present in the summary.\n\
              \n\
              Log summary:\n\
-             {summary_json}"
+             {summary_json}\n\
+             \n\
+             Return ONLY valid JSON with no markdown code fences, no backticks, no explanation. Raw JSON only."
         );
 
         let messages = vec![ApiMessage {
