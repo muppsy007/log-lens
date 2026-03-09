@@ -19,6 +19,10 @@ pub struct Issue {
     pub explanation: String,
     /// Concrete next step for the engineer
     pub action: String,
+    /// Representative raw log lines supporting this issue.
+    /// Populated post-LLM by the server handler — never sent to the model.
+    #[serde(default)]
+    pub evidence: Vec<String>,
 }
 
 /// The structured analysis produced by the AI layer for a log batch.

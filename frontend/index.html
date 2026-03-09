@@ -255,6 +255,32 @@
       margin-top: 6px;
     }
 
+    .evidence-toggle {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.78rem;
+      padding: 2px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+    .evidence-toggle:hover { color: var(--text); border-color: var(--text); }
+
+    .evidence-block {
+      margin-top: 8px;
+      padding: 10px 12px;
+      background: rgba(0,0,0,0.3);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-family: 'SFMono-Regular', Consolas, monospace;
+      font-size: 0.78rem;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow-x: auto;
+    }
+
     /* ── Raw / empty fallbacks ──────────────────────────────────────────── */
     .raw-fallback {
       background: #1f1a02;
@@ -588,6 +614,28 @@
             `<strong>${escHtml(issue.title)}</strong>` +
             `<p>${escHtml(issue.explanation)}</p>` +
             `<p class="action">→ ${escHtml(issue.action)}</p>`;
+
+          // Evidence toggle — only rendered when sample lines are present.
+          const lines = issue.evidence || [];
+          if (lines.length > 0) {
+            const btn = document.createElement('button');
+            btn.className = 'evidence-toggle';
+            btn.textContent = `Show evidence (${lines.length} line${lines.length > 1 ? 's' : ''})`;
+            const pre = document.createElement('pre');
+            pre.className = 'evidence-block';
+            pre.hidden = true;
+            pre.textContent = lines.join('\n');
+            btn.addEventListener('click', () => {
+              const showing = !pre.hidden;
+              pre.hidden = showing;
+              btn.textContent = showing
+                ? `Show evidence (${lines.length} line${lines.length > 1 ? 's' : ''})`
+                : `Hide evidence`;
+            });
+            card.appendChild(btn);
+            card.appendChild(pre);
+          }
+
           container.appendChild(card);
         }
       } else if (analysis.raw) {
