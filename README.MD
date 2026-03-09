@@ -4,6 +4,7 @@
 
 log-lens is a Rust-native log analysis tool with an LLM reasoning layer. It parses log files of any format, computes aggregate statistics, and uses the Anthropic API to explain what's wrong — with a persistent Q&A interface for follow-up.
 
+![Screenshot](docs/screenshots/apache-log-output.png)
 ---
 
 ## Why this exists
