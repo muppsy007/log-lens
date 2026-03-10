@@ -634,8 +634,21 @@
       const es = new EventSource(url);
 
       es.addEventListener('progress', (e) => {
-        const { message } = JSON.parse(e.data);
-        progressLogAppend(message);
+        const { stage, message } = JSON.parse(e.data);
+        // Map stage identifiers to display labels so the UI stays accurate
+        // even when server message text changes. Fall back to server message
+        // for dynamic stages (e.g. "parsing" includes the record count).
+        const STAGE_LABELS = {
+          reading:      'Reading log file…',
+          detecting:    'Detecting log format…',
+          format_known: 'Apache Combined Log format detected',
+          format_cached:'Schema loaded from cache',
+          format_unknown:'Unknown format — inferring schema with LLM…',
+          cached:       'Schema inferred and cached',
+          aggregating:  'Aggregating statistics…',
+          analysing:    'Sending summary to AI for analysis…',
+        };
+        progressLogAppend(STAGE_LABELS[stage] ?? message);
       });
 
       es.addEventListener('complete', (e) => {
