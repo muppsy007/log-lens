@@ -110,7 +110,10 @@ impl AnalysisEngine for AnthropicEngine {
              Return this exact shape:\n\
              {{\"issues\": [{{\"severity\": \"critical|warning|info\", \"title\": \"short label\", \"explanation\": \"1-2 sentences on what is wrong\", \"action\": \"concrete next step\"}}]}}\n\
              \n\
-             Order issues by severity: critical first. Be specific — reference actual counts and paths from the data. Do not invent data not present in the summary.\n\
+             Order issues by severity: critical first. Be specific — reference actual counts, paths, and error messages from the data.\n\
+             The `top_errors` field contains structured error entries with `message`, `level`, `count`, and optionally `file` and `line` fields.\n\
+             When `file` and `line` are present, cite them in your explanation (e.g. \"Error in src/Foo.php:42\").\n\
+             Do not invent data not present in the summary.\n\
              \n\
              Log summary:\n\
              {summary_json}\n\
