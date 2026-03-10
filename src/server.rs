@@ -185,28 +185,28 @@ async fn summary_handler(
             }
         };
 
-        // Join evidence to issues post-LLM.
+        // Join evidence to issues using the indices the LLM assigned.
         //
-        // Matching strategy: first try exact substring (works well for short
-        // Apache path patterns like "/api/search"). If that fails, fall back to
-        // word-overlap: any word longer than 4 chars from the evidence pattern
-        // that appears in the LLM-generated title+explanation is sufficient.
-        // This handles inferred logs where patterns are full error messages that
-        // the LLM paraphrases rather than reproducing verbatim.
-        for issue in &mut analysis.issues {
-            let needle = format!("{} {}", issue.title, issue.explanation).to_lowercase();
-            for ev in &out.evidence {
-                let pattern_lower = ev.pattern.to_lowercase();
-                let matched = needle.contains(&pattern_lower) || {
-                    pattern_lower
-                        .split(|c: char| !c.is_alphanumeric())
-                        .filter(|w| w.len() > 4)
-                        .any(|word| needle.contains(word))
-                };
-                if matched {
-                    issue.evidence.extend(ev.sample_lines.iter().cloned());
-                    issue.evidence.truncate(5);
-                    break;
+        // The LLM includes `evidence_indices` in each issue: zero-based indices
+        // into `summary.top_errors`. We look up the corresponding raw log lines
+        // from `out.evidence` (keyed by the same pattern string used in top_errors)
+        // and attach up to 3 lines per referenced entry.
+        {
+            // Build a lookup from top_errors pattern → sample lines.
+            use std::collections::HashMap;
+            let line_map: HashMap<&str, &[String]> = out
+                .evidence
+                .iter()
+                .map(|ev| (ev.pattern.as_str(), ev.sample_lines.as_slice()))
+                .collect();
+
+            for issue in &mut analysis.issues {
+                for &idx in &issue.evidence_indices {
+                    if let Some(detail) = summary.top_errors.get(idx) {
+                        if let Some(lines) = line_map.get(detail.message.as_str()) {
+                            issue.evidence.extend(lines.iter().take(3).cloned());
+                        }
+                    }
                 }
             }
         }

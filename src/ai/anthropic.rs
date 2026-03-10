@@ -108,11 +108,17 @@ impl AnalysisEngine for AnthropicEngine {
              Analyse this log summary and return ONLY a JSON object — no prose, no markdown, no explanation outside the JSON.\n\
              \n\
              Return this exact shape:\n\
-             {{\"issues\": [{{\"severity\": \"critical|warning|info\", \"title\": \"short label\", \"explanation\": \"1-2 sentences on what is wrong\", \"action\": \"concrete next step\"}}]}}\n\
+             {{\"issues\": [{{\"severity\": \"critical|warning|info\", \"title\": \"short label\", \"explanation\": \"1-2 sentences on what is wrong\", \"action\": \"concrete next step\", \"evidence_indices\": [0, 2]}}]}}\n\
+             \n\
+             The `evidence_indices` field lists zero-based indices into the `top_errors` array in the log summary.\n\
+             Each index points to a `top_errors` entry that is direct evidence for that issue.\n\
+             Rules:\n\
+             - Use [] when `top_errors` is empty or no entry is relevant to the issue.\n\
+             - An index may appear in at most one issue's evidence_indices.\n\
+             - Include all indices that are genuinely relevant; omit unrelated ones.\n\
              \n\
              Order issues by severity: critical first. Be specific — reference actual counts, paths, and error messages from the data.\n\
-             The `top_errors` field contains structured error entries with `message`, `level`, `count`, and optionally `file` and `line` fields.\n\
-             When `file` and `line` are present, cite them in your explanation (e.g. \"Error in src/Foo.php:42\").\n\
+             When a `top_errors` entry has `file` and `line` fields, cite them in your explanation (e.g. \"Error in src/Foo.php:42\").\n\
              Do not invent data not present in the summary.\n\
              \n\
              Log summary:\n\
