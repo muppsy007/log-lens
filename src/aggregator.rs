@@ -8,6 +8,7 @@ use crate::parser::LogRecord;
 /// Sample log lines associated with a particular error pattern.
 /// Used to attach representative evidence to triage issues without ever
 /// sending raw lines to the LLM (the join happens post-analysis).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ErrorEvidence {
     /// The error path (or message prefix) used as the grouping key.
@@ -27,6 +28,22 @@ pub struct ErrorEvidence {
 pub struct AggregatorOutput {
     pub summary: LogSummary,
     pub evidence: Vec<ErrorEvidence>,
+}
+
+/// Structured detail about a recurring error, extracted from parsed log records.
+/// Sent to the LLM so it can reference specific messages, files, and line numbers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    /// The error message text (deduplication key).
+    pub message: String,
+    /// Source file reported by the logger, if present.
+    pub file: Option<String>,
+    /// Source line number reported by the logger, if present.
+    pub line: Option<u32>,
+    /// Severity level string: ERROR, WARNING, CRITICAL, etc.
+    pub level: String,
+    /// Number of times this exact message appeared in the batch.
+    pub count: u32,
 }
 
 /// An IP address flagged as suspicious by one or more heuristics.
@@ -59,11 +76,11 @@ pub struct LogSummary {
     /// Count of records grouped by HTTP status code.
     #[serde_as(as = "HashMap<DisplayFromStr, _>")]
     pub status_counts: HashMap<u16, u64>,
-    /// Top 10 error paths by frequency (path/message-prefix, count).
-    /// Grouped by request path when available; otherwise by the first 60
-    /// characters of the log message. Covers 4xx and 5xx responses.
+    /// Top 20 errors by frequency, with structured metadata where available.
+    /// For Apache records this is keyed by request path; for inferred records
+    /// the message, file, and line fields are extracted from the parsed fields.
     #[serde(default)]
-    pub top_errors: Vec<(String, u32)>,
+    pub top_errors: Vec<ErrorDetail>,
     /// Top 5 paths by p99 latency (path, p99_latency_ms).
     /// Empty when the parsed records contain no latency data.
     #[serde(default)]
@@ -87,9 +104,9 @@ pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
     let total = records.len() as u64;
 
     let mut status_counts: HashMap<u16, u64> = HashMap::new();
-    // (path or message-prefix) → error count
-    let mut error_path_counts: HashMap<String, u32> = HashMap::new();
-    // (path or message-prefix) → up to 10 raw log lines for that error pattern
+    // message/path → ErrorDetail (deduplication key is the message string)
+    let mut error_details: HashMap<String, ErrorDetail> = HashMap::new();
+    // message/path → up to 10 raw log lines for that error pattern
     let mut error_path_samples: HashMap<String, Vec<String>> = HashMap::new();
     // path → collected latency samples for p99 computation
     let mut latency_samples: HashMap<String, Vec<f64>> = HashMap::new();
@@ -107,10 +124,21 @@ pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
     for record in &records {
         match record {
             LogRecord::Apache(r) => {
-                *status_counts.entry(r.status).or_insert(0) += 1;
+                // Only count genuine HTTP status codes (100–599).
+                if (100..600).contains(&r.status) {
+                    *status_counts.entry(r.status).or_insert(0) += 1;
+                }
 
                 if r.status >= 400 {
-                    *error_path_counts.entry(r.path.clone()).or_insert(0) += 1;
+                    let level = if r.status >= 500 { "ERROR" } else { "WARNING" }.to_string();
+                    let entry = error_details.entry(r.path.clone()).or_insert_with(|| ErrorDetail {
+                        message: r.path.clone(),
+                        file: None,
+                        line: None,
+                        level,
+                        count: 0,
+                    });
+                    entry.count += 1;
                     let samples = error_path_samples.entry(r.path.clone()).or_default();
                     if samples.len() < 10 {
                         samples.push(r.raw.clone());
@@ -136,16 +164,20 @@ pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
                 }
             }
             LogRecord::Inferred(r) => {
-                let status = ["status", "status_code", "code", "http_status"]
+                // "code" is intentionally excluded — PHP error constants use a
+                // `code` field (e.g. 8192 = E_DEPRECATED, 512 = E_USER_ERROR)
+                // that must not be mistaken for HTTP status codes.
+                let status = ["status", "status_code", "http_status"]
                     .iter()
                     .find_map(|&k| r.fields.get(k))
                     .and_then(|v| v.parse::<u16>().ok());
 
-                if let Some(s) = status {
+                // Only count genuine HTTP status codes (100–599).
+                if let Some(s) = status.filter(|&s| (100..600).contains(&s)) {
                     *status_counts.entry(s).or_insert(0) += 1;
 
                     if s >= 400 {
-                        let key = ["path", "url", "uri", "request_path"]
+                        let path_key = ["path", "url", "uri", "request_path"]
                             .iter()
                             .find_map(|&k| r.fields.get(k))
                             .cloned()
@@ -156,10 +188,61 @@ pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
                                     .map(|v| v.chars().take(60).collect())
                                     .unwrap_or_default()
                             });
-                        *error_path_counts.entry(key.clone()).or_insert(0) += 1;
-                        let samples = error_path_samples.entry(key).or_default();
+                        let level = if s >= 500 { "ERROR" } else { "WARNING" }.to_string();
+                        let entry = error_details.entry(path_key.clone()).or_insert_with(|| ErrorDetail {
+                            message: path_key.clone(),
+                            file: None,
+                            line: None,
+                            level,
+                            count: 0,
+                        });
+                        entry.count += 1;
+                        let samples = error_path_samples.entry(path_key).or_default();
                         if samples.len() < 10 {
                             samples.push(r.raw.clone());
+                        }
+                    }
+                }
+
+                // For application logs (no HTTP status), extract message/file/line/level.
+                let level_val = ["level", "severity", "log_level", "loglevel", "priority"]
+                    .iter()
+                    .find_map(|&k| r.fields.get(k))
+                    .cloned();
+
+                if status.is_none() || !(100..600).contains(&status.unwrap_or(0)) {
+                    if let Some(ref level) = level_val {
+                        let level_upper = level.to_uppercase();
+                        let is_error_level = ["ERROR", "CRITICAL", "ALERT", "EMERGENCY", "WARNING", "WARN"]
+                            .iter()
+                            .any(|&l| level_upper.contains(l));
+                        if is_error_level {
+                            let message = ["message", "msg", "error", "exception", "text"]
+                                .iter()
+                                .find_map(|&k| r.fields.get(k))
+                                .cloned()
+                                .unwrap_or_else(|| r.raw.chars().take(80).collect());
+                            let key = message.chars().take(120).collect::<String>();
+                            let file = ["file", "filename", "source_file", "src_file"]
+                                .iter()
+                                .find_map(|&k| r.fields.get(k))
+                                .cloned();
+                            let line = ["line", "lineno", "line_number", "src_line"]
+                                .iter()
+                                .find_map(|&k| r.fields.get(k))
+                                .and_then(|v| v.parse::<u32>().ok());
+                            let entry = error_details.entry(key.clone()).or_insert_with(|| ErrorDetail {
+                                message: key.clone(),
+                                file,
+                                line,
+                                level: level_upper,
+                                count: 0,
+                            });
+                            entry.count += 1;
+                            let samples = error_path_samples.entry(key).or_default();
+                            if samples.len() < 10 {
+                                samples.push(r.raw.clone());
+                            }
                         }
                     }
                 }
@@ -248,16 +331,16 @@ pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
         error_count as f64 / total as f64
     };
 
-    let mut top_errors_with_counts: Vec<(String, u32)> = error_path_counts.into_iter().collect();
-    top_errors_with_counts.sort_by(|a, b| b.1.cmp(&a.1));
-    top_errors_with_counts.truncate(10);
+    let mut top_errors: Vec<ErrorDetail> = error_details.into_values().collect();
+    top_errors.sort_by(|a, b| b.count.cmp(&a.count));
+    top_errors.truncate(20);
 
-    // Build evidence from the top error paths (in the same order as top_errors).
-    let mut evidence: Vec<ErrorEvidence> = top_errors_with_counts
+    // Build evidence from the top error entries (in the same order as top_errors).
+    let mut evidence: Vec<ErrorEvidence> = top_errors
         .iter()
-        .map(|(pattern, count)| {
-            let sample_lines = error_path_samples.remove(pattern).unwrap_or_default();
-            ErrorEvidence { pattern: pattern.clone(), count: *count, sample_lines }
+        .map(|detail| {
+            let sample_lines = error_path_samples.remove(&detail.message).unwrap_or_default();
+            ErrorEvidence { pattern: detail.message.clone(), count: detail.count, sample_lines }
         })
         .collect();
 
@@ -270,8 +353,6 @@ pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
             sample_lines,
         });
     }
-
-    let top_errors: Vec<(String, u32)> = top_errors_with_counts;
 
     let mut top_slow_paths: Vec<(String, f64)> = latency_samples
         .into_iter()
@@ -372,11 +453,36 @@ mod tests {
             apache_record_path(200, "/ok"),
         ];
         let out = aggregate(records);
-        assert_eq!(out.summary.top_errors[0].0, "/api/search");
-        assert_eq!(out.summary.top_errors[0].1, 2);
-        assert_eq!(out.summary.top_errors[1].0, "/missing");
-        assert_eq!(out.summary.top_errors[1].1, 1);
-        assert!(!out.summary.top_errors.iter().any(|(p, _)| p == "/ok"));
+        assert_eq!(out.summary.top_errors[0].message, "/api/search");
+        assert_eq!(out.summary.top_errors[0].count, 2);
+        assert_eq!(out.summary.top_errors[1].message, "/missing");
+        assert_eq!(out.summary.top_errors[1].count, 1);
+        assert!(!out.summary.top_errors.iter().any(|e| e.message == "/ok"));
+    }
+
+    #[test]
+    fn status_counts_excludes_non_http_codes() {
+        use crate::parser::{InferredRecord, LogRecord};
+        // PHP error constants stored in a `code` field (8192 = E_DEPRECATED,
+        // 512 = E_USER_ERROR) must not appear in status_counts even when `code`
+        // is in the range 100–599.
+        let mut fields = HashMap::new();
+        fields.insert("code".to_string(), "512".to_string());
+        fields.insert("message".to_string(), "PHP user error".to_string());
+        let record_512 = LogRecord::Inferred(InferredRecord {
+            fields: fields.clone(),
+            raw: "php user error line".to_string(),
+        });
+        let mut fields2 = HashMap::new();
+        fields2.insert("code".to_string(), "8192".to_string());
+        fields2.insert("message".to_string(), "PHP deprecated".to_string());
+        let record_8192 = LogRecord::Inferred(InferredRecord {
+            fields: fields2,
+            raw: "php deprecated line".to_string(),
+        });
+        let out = aggregate(vec![record_512, record_8192]);
+        assert!(!out.summary.status_counts.contains_key(&512u16), "512 must not be a status code");
+        assert!(!out.summary.status_counts.contains_key(&8192u16), "8192 must not be a status code");
     }
 
     #[test]

@@ -186,10 +186,24 @@ async fn summary_handler(
         };
 
         // Join evidence to issues post-LLM.
+        //
+        // Matching strategy: first try exact substring (works well for short
+        // Apache path patterns like "/api/search"). If that fails, fall back to
+        // word-overlap: any word longer than 4 chars from the evidence pattern
+        // that appears in the LLM-generated title+explanation is sufficient.
+        // This handles inferred logs where patterns are full error messages that
+        // the LLM paraphrases rather than reproducing verbatim.
         for issue in &mut analysis.issues {
             let needle = format!("{} {}", issue.title, issue.explanation).to_lowercase();
             for ev in &out.evidence {
-                if needle.contains(&ev.pattern.to_lowercase()) {
+                let pattern_lower = ev.pattern.to_lowercase();
+                let matched = needle.contains(&pattern_lower) || {
+                    pattern_lower
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|w| w.len() > 4)
+                        .any(|word| needle.contains(word))
+                };
+                if matched {
                     issue.evidence.extend(ev.sample_lines.iter().cloned());
                     issue.evidence.truncate(5);
                     break;
