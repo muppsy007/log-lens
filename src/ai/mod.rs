@@ -19,8 +19,13 @@ pub struct Issue {
     pub explanation: String,
     /// Concrete next step for the engineer
     pub action: String,
+    /// Indices into `LogSummary.top_errors` that support this issue.
+    /// The LLM assigns these at generation time; the server uses them to fetch
+    /// representative raw log lines without any post-hoc text matching.
+    #[serde(default)]
+    pub evidence_indices: Vec<usize>,
     /// Representative raw log lines supporting this issue.
-    /// Populated post-LLM by the server handler — never sent to the model.
+    /// Populated by the server from `evidence_indices` — never sent to the model.
     #[serde(default)]
     pub evidence: Vec<String>,
 }

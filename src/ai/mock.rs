@@ -27,6 +27,7 @@ impl AnalysisEngine for MockEngine {
                         summary.total
                     ),
                     action: "Investigate the root cause immediately.".to_string(),
+                    evidence_indices: vec![],
                     evidence: vec![],
                 },
                 Issue {
@@ -34,6 +35,7 @@ impl AnalysisEngine for MockEngine {
                     title: "Mock warning issue".to_string(),
                     explanation: "Some paths returned 4xx responses.".to_string(),
                     action: "Review client request patterns.".to_string(),
+                    evidence_indices: vec![],
                     evidence: vec![],
                 },
             ],
