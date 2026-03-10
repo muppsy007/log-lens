@@ -71,22 +71,24 @@ pub struct AiInferredParser {
 impl AiInferredParser {
     /// Constructs a parser for the given sample lines.
     ///
-    /// On cache hit the strategy is loaded from disk with no API call.
-    /// On cache miss the LLM is queried once, the strategy is cached, then used.
-    pub async fn new(sample_lines: &[&str]) -> Result<Self> {
+    /// Returns `(parser, cache_hit)`. `cache_hit` is `true` when the strategy
+    /// was loaded from disk with no API call; `false` when the LLM was queried.
+    /// Callers use the flag to emit an accurate progress message rather than
+    /// guessing before the call whether the cache will hit.
+    pub async fn new(sample_lines: &[&str]) -> Result<(Self, bool)> {
         let shape = structural_shape(sample_lines);
         let cache_key = sha256_hex(&shape);
 
         let cache = load_cache()?;
 
-        let strategy = if let Some(cached) = cache.get(&cache_key) {
-            cached.clone()
+        let (strategy, cache_hit) = if let Some(cached) = cache.get(&cache_key) {
+            (cached.clone(), true)
         } else {
             let strategy = infer_strategy_from_llm(sample_lines).await?;
             let mut fresh_cache = load_cache()?;
             fresh_cache.insert(cache_key, strategy.clone());
             save_cache(&fresh_cache)?;
-            strategy
+            (strategy, false)
         };
 
         let re = Regex::new(&strategy.outer_regex).map_err(|e| {
@@ -96,11 +98,11 @@ impl AiInferredParser {
             )
         })?;
 
-        Ok(Self {
+        Ok((Self {
             re,
             context_field: strategy.context_field,
             parse_context_as_json: strategy.parse_context_as_json,
-        })
+        }, cache_hit))
     }
 }
 
@@ -413,7 +415,7 @@ mod tests {
             "2026-03-07T09:12:03 ERROR 127.0.0.1 404",
             "2026-03-07T09:13:00 INFO  10.0.0.1  200",
         ];
-        let parser = AiInferredParser::new(lines)
+        let (parser, _cache_hit) = AiInferredParser::new(lines)
             .await
             .expect("parser construction must succeed");
 

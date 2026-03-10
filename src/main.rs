@@ -134,11 +134,16 @@ async fn run_analysis(file_path: &str) -> Result<()> {
         println!("{}", "Detected format: Apache Combined Log".dimmed());
         Box::new(apache_parser)
     } else {
-        println!(
-            "{}",
-            "Format not recognised — asking LLM to infer schema…".yellow()
-        );
-        Box::new(AiInferredParser::new(&sample).await?)
+        let (parser, cache_hit) = AiInferredParser::new(&sample).await?;
+        if cache_hit {
+            println!("{}", "Format not recognised — using cached schema…".dimmed());
+        } else {
+            println!(
+                "{}",
+                "Format not recognised — schema inferred and cached…".yellow()
+            );
+        }
+        Box::new(parser)
     };
 
     // -----------------------------------------------------------------------

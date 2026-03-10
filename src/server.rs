@@ -293,11 +293,15 @@ async fn parse_file_to_aggregator_output(
         send!(progress("format_known", "Apache access log detected"));
         None
     } else {
-        send!(progress("format_unknown", "Unknown format — asking LLM to infer schema"));
-        let p = AiInferredParser::new(&sample).await?;
-        // Stage 4 — schema ready (cache hit or miss handled inside the parser).
-        send!(progress("cached", "Schema inferred and cached for future use"));
-        Some(p)
+        // Send a holding message while we check the cache / call the LLM.
+        send!(progress("detecting", "Checking schema cache for unknown format"));
+        let (parser, cache_hit) = AiInferredParser::new(&sample).await?;
+        if cache_hit {
+            send!(progress("format_cached", "Schema loaded from cache"));
+        } else {
+            send!(progress("format_unknown", "Schema inferred from LLM and cached"));
+        }
+        Some(parser)
     };
 
     // Stage 5 — parsing
