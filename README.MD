@@ -2,18 +2,24 @@
 
 > Ingest any log file. Get a plain-English diagnosis. Ask follow-up questions.
 
-log-lens is a Rust-native log analysis tool with an LLM reasoning layer. It parses log files of any format, computes aggregate statistics, and uses the Anthropic API to explain what's wrong — with a persistent Q&A interface for follow-up.
+log-lens is a Rust-native log analysis tool with an LLM reasoning layer. It parses log files of any format, aggregates statistics, and uses the Anthropic API to produce a structured triage report — with an interactive browser UI for charts, history browsing, and follow-up Q&A.
+
+Two modes:
+
+- **CLI** — one-shot report printed to the terminal
+- **Web UI** — persistent server at `localhost:3000` with a chart dashboard, analysis history, and a chat interface
 
 ![Screenshot](docs/screenshots/apache-log-output.png)
+
 ---
 
 ## Why this exists
 
 Two primary problem definitions:
-1. Engineering teams often consume time undertaking Bug Triage sessions to identify, prioritise and even fix bugs. This is not a glamorous part of engineering, and even armed with excellent ingestion platforms like Sentry and Bugsnag, there is still a lot of manual thought-work for engineering teams
+1. Engineering teams often consume time undertaking Bug Triage sessions to identify, prioritise and even fix bugs. This is not a glamorous part of engineering, and even armed with excellent ingestion platforms like Sentry and Bugsnag, there is still a lot of manual thought-work for engineering teams.
 2. Small non-tech companies often do not have in-house technical resource, but do have web presences and applications. Smarter log digesting could help them prioritise and communicate with their casual tech contractors.
 
-This tool aims to act as an automated bug triage engineer, locating impacts, providing risk analysis and plain English explanations on what is most important to resolve and why.
+This tool aims to act as an automated bug triage engineer — locating impacts, providing risk analysis, and giving plain-English explanations of what is most important to resolve and why.
 
 Most log analysis tools require you to already know what you're looking for. log-lens inverts that: give it a log file you've never seen before, get a structured diagnosis, then interrogate it conversationally.
 
@@ -23,13 +29,13 @@ It handles format heterogeneity via AI-inferred parsing — meaning it works on 
 
 ## Architecture
 
-The stack is intentionally split by concern:
-
 | Layer | Technology | Rationale |
 |---|---|---|
-| Parsing & aggregation | Rust | Zero-copy buffer slicing, typed domain model, safe parallel ingestion via Tokio |
+| Parsing & aggregation | Rust | Zero-copy buffer slicing, typed domain model, async ingestion via Tokio |
 | AI reasoning | `AnalysisEngine` trait → `AnthropicEngine` | Dependency-inverted abstraction; AI provider is a seam, not a dependency |
-| Web interface | Axum + Chart.js | Single Rust runtime, no second-language deployment story |
+| Web server & SSE | Axum | Single Rust runtime; real-time progress streaming via Server-Sent Events |
+| Result persistence | SQLite via sqlx | Analysis history stored locally; no external database required |
+| Web UI | Chart.js | Single HTML file, no build step |
 
 **The key architectural decision** is the `AnalysisEngine` trait. Nothing outside `src/ai/` depends on `AnthropicEngine` directly. Swapping to a Python microservice, a different LLM, or a local model is a drop-in replacement — no changes outside `src/ai/`.
 
@@ -40,19 +46,19 @@ pub trait AnalysisEngine: Send + Sync {
 }
 ```
 
-The LLM never receives raw log lines. It receives a compact `LogSummary` struct produced by the Rust aggregation pipeline. This keeps token usage minimal, forces meaningful computation to happen in Rust, and means the system works without real production data.
+The LLM never receives raw log lines. It receives a compact `LogSummary` struct produced by the Rust aggregation pipeline. This keeps token usage minimal, forces meaningful computation into Rust, and means the system works without real production data.
 
 ---
 
 ## Log ingestion: tiered parsing
 
 ```
-Tier 1 — explicit --format flag     → built-in parser, no API call
-Tier 2 — auto-detect (first 5 lines) → built-in parser heuristics, no API call
-Tier 3 — no match                   → LLM infers schema from 20 sample lines, cached locally
+Tier 1 — auto-detect (first 5 lines) → built-in parser heuristics, no API call
+Tier 2 — no match                    → LLM infers schema from 20 sample lines,
+                                        result cached to ~/.cache/log-lens/schemas.json
 ```
 
-Built-in formats: Apache Combined, Nginx access, JSON structured, Syslog.
+Built-in formats: Apache Combined Log.
 
 ---
 
@@ -63,21 +69,23 @@ src/
 ├── main.rs              # CLI entrypoint (clap), mode routing
 ├── parser/
 │   ├── mod.rs           # Parser trait + LogRecord enum
-│   ├── apache.rs
-│   ├── nginx.rs
-│   ├── json.rs
+│   ├── apache.rs        # Apache Combined Log parser
 │   └── ai_infer.rs      # AI-inferred format fallback + schema cache
-├── aggregator.rs        # Pure stats: error rates, status codes, latency percentiles
+├── aggregator.rs        # Stats: error rates, status codes, top errors, latency percentiles
 ├── summary.rs           # LogSummary → compact JSON for AI
+├── store.rs             # SQLite-backed result persistence (sqlx)
 ├── ai/
 │   ├── mod.rs           # AnalysisEngine trait — the abstraction boundary
 │   ├── anthropic.rs     # Concrete impl, reads ANTHROPIC_API_KEY from env
-│   └── mock.rs          # Canned responses for tests and offline dev
-└── server.rs            # Axum: REST + SSE endpoints
+│   └── mock.rs          # Canned responses for tests
+└── server.rs            # Axum: SSE analysis pipeline + REST endpoints
 frontend/
-└── index.html           # Single-file UI, no build step
+└── index.html           # Single-file UI: charts, analysis history, chat
 samples/
-└── apache_sample.log    # Synthetic data only
+├── apache-access.log    # Synthetic Apache access log
+├── apache-error.log     # Synthetic Apache error log
+├── node-error.log       # Synthetic Node.js error log
+└── unknown.log          # Synthetic application log (unknown format)
 ```
 
 ---
@@ -94,26 +102,46 @@ export ANTHROPIC_API_KEY=sk-ant-...
 **Build**
 
 ```bash
-cargo new log-lens && cd log-lens
-# Add dependencies per Cargo.toml
+git clone <repo-url>
+cd log-lens
 cargo build
 ```
 
-**Usage**
+**Usage — CLI mode**
+
+Run a one-shot analysis and print the report to the terminal:
 
 ```bash
-# Auto-detect format, print plain-English report
-cargo run -- --file samples/apache_sample.log
-
-# Force format
-cargo run -- --file access.log --format apache
-
-# Interactive Q&A in terminal
-cargo run -- --file access.log --interactive
-
-# Web interface at localhost:3000
-cargo run -- --file access.log --serve
+cargo run -- --file samples/apache-access.log
 ```
+
+**Usage — Web UI mode**
+
+Start the server (no `--file` flag — the file is chosen in the browser):
+
+```bash
+cargo run -- --serve
+```
+
+Then open **http://localhost:3000** in your browser. Type a log file path into the input box (e.g. `samples/apache-access.log`) and click **Analyse**.
+
+The UI shows:
+- A real-time progress log as the pipeline runs
+- Structured issue cards with severity badges and evidence lines
+- A status code distribution chart
+- A dropdown of previous analyses
+- A chat input for follow-up questions
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | *(required)* | Anthropic API key |
+| `LOG_LENS_PORT` | `3000` | Port the web server listens on |
+| `LOG_LENS_HOST` | `127.0.0.1` | Interface the web server binds to |
+| `DATABASE_URL` | `sqlite:./log_lens.db` | SQLite path for storing analysis history |
 
 ---
 
@@ -121,14 +149,18 @@ cargo run -- --file access.log --serve
 
 | Purpose | Crate |
 |---|---|
-| Async runtime | `tokio` (full features) |
+| Async runtime | `tokio` |
 | Web server | `axum 0.7` |
+| SSE / streams | `tokio-stream` |
 | HTTP client | `reqwest 0.12` |
-| Serialisation | `serde` + `serde_json` |
+| Serialisation | `serde` + `serde_json` + `serde_with` |
+| Database | `sqlx 0.7` (SQLite) |
 | Regex | `regex` |
 | CLI | `clap 4` |
-| Date/time | `chrono` |
+| Hashing | `sha2` |
 | Error handling | `anyhow` |
+| Async traits | `async-trait` |
+| Terminal colour | `colored` |
 | Middleware | `tower-http` (fs, cors) |
 
 ---
@@ -137,21 +169,21 @@ cargo run -- --file access.log --serve
 
 The current architecture doesn't foreclose:
 
-- **Streaming ingestion** — async `BufReader` + `lines()` from the start; no full-file-load assumption
-- **High volume** — zero-copy buffer slicing; no `String` allocation per parsed field
-- **Multiple simultaneous sources** — `Parser` trait is object-safe; `Aggregator` accepts streams
+- **Streaming ingestion** — async `BufReader` already in use; extending to tail/socket streams is additive
+- **High volume** — aggregation is a single-pass pipeline; window-based batching is a drop-in
+- **Multiple simultaneous sources** — `Parser` trait is object-safe; sources can be fanned in
 - **Python AI microservice** — implement `AnalysisEngine` as an HTTP client; everything else unchanged
-- **Different LLM providers** — same seam; new provider is a new `impl`, not a refactor
-- **Persistent storage** — all summary and history structs derive `Serialize` from day one
+- **Different LLM providers** — new provider is a new `impl AnalysisEngine`, not a refactor
+- **Additional built-in parsers** — add a module under `src/parser/`, register in `mod.rs`
 
 ---
 
-## Intentional Design constraints 
+## Intentional design constraints
 
 - Raw log lines are never sent to the LLM
 - `AnthropicEngine` is not visible outside `src/ai/`
 - `samples/` contains only synthetic data
-- The web server is Rust/Axum — not FastAPI — to maintain a single runtime
+- The web server is Rust/Axum — not a separate Python process — to maintain a single runtime
 
 ---
 
