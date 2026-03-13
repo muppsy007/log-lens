@@ -1,24 +1,17 @@
 mod aggregator;
 mod ai;
 mod parser;
+mod pipeline;
 pub mod server;
 mod store;
 
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 // The derive macro is re-exported as `clap::Parser`; aliasing it avoids a
 // name collision with our own `parser::Parser` trait in the same scope.
 use clap::Parser as ClapParser;
 use colored::Colorize;
 
-use aggregator::aggregate;
 use ai::{anthropic::AnthropicEngine, AnalysisEngine};
-use parser::ai_infer::AiInferredParser;
-use parser::apache::ApacheParser;
-// Import our Parser trait so `.parse()` is in scope on both parser types.
-use parser::Parser;
 
 /// CLI configuration. Clap derives argument parsing from the struct fields.
 #[derive(ClapParser)]
@@ -92,89 +85,24 @@ async fn run_server() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn run_analysis(file_path: &str) -> Result<()> {
-    // -----------------------------------------------------------------------
-    // 1. Read file into memory
-    // -----------------------------------------------------------------------
-
-    let file = File::open(file_path)
-        .with_context(|| format!("Could not open file: {file_path}"))?;
-
-    // Collect all lines so we can sample for format detection before choosing
-    // a parser without reading the file twice.
-    let lines: Vec<String> = BufReader::new(file)
-        .lines()
-        .collect::<std::io::Result<Vec<_>>>()?;
-
-    // -----------------------------------------------------------------------
-    // 2. Format detection (Tier 2 → Tier 3)
-    // -----------------------------------------------------------------------
-
-    let sample: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .take(20)
-        .map(String::as_str)
-        .collect();
-
-    if sample.is_empty() {
-        eprintln!("{}", "No non-empty lines found in file.".red());
-        std::process::exit(1);
-    }
-
-    let apache_parser = ApacheParser::new()?;
-    let tier2_sample = &sample[..sample.len().min(5)];
-    let apache_hits = tier2_sample
-        .iter()
-        .filter(|l| apache_parser.parse(l).is_ok())
-        .count();
-
-    let parser: Box<dyn Parser> = if apache_hits * 2 >= tier2_sample.len() {
-        println!("{}", "Detected format: Apache Combined Log".dimmed());
-        Box::new(apache_parser)
-    } else {
-        let (parser, cache_hit) = AiInferredParser::new(&sample).await?;
-        if cache_hit {
-            println!("{}", "Format not recognised — using cached schema…".dimmed());
-        } else {
-            println!(
-                "{}",
-                "Format not recognised — schema inferred and cached…".yellow()
-            );
+    let (out, skipped) = pipeline::parse_and_aggregate(file_path, |stage, msg| {
+        match stage {
+            "format_unknown" => println!("{}", msg.yellow()),
+            "format_known" | "format_cached" => println!("{}", msg.dimmed()),
+            _ => {}
         }
-        Box::new(parser)
-    };
-
-    // -----------------------------------------------------------------------
-    // 3. Parse all lines
-    // -----------------------------------------------------------------------
-
-    let mut records = Vec::new();
-    let mut skipped: usize = 0;
-
-    for line in &lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match parser.parse(line) {
-            Ok(record) => records.push(record),
-            Err(_) => skipped += 1,
-        }
-    }
+    })
+    .await?;
 
     if skipped > 0 {
         eprintln!("{}", format!("Warning: skipped {skipped} malformed lines").yellow());
     }
 
-    if records.is_empty() {
+    if out.summary.total == 0 {
         eprintln!("{}", "No valid log records found — check the file format.".red());
         std::process::exit(1);
     }
 
-    // -----------------------------------------------------------------------
-    // 4. Aggregate
-    // -----------------------------------------------------------------------
-
-    let out = aggregate(records);
     let summary = out.summary;
     let summary_json = serde_json::to_string(&summary)?;
 
