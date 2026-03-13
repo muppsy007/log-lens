@@ -6,7 +6,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::{AnalysisEngine, AnalysisResult, Message};
-use crate::summary::to_json;
 use crate::aggregator::LogSummary;
 
 /// Model used for all API calls. Defined as a constant so it appears in one
@@ -101,7 +100,7 @@ impl AnalysisEngine for AnthropicEngine {
     async fn analyse(&self, summary: &LogSummary) -> Result<AnalysisResult> {
         // Serialise to compact JSON — only the aggregated summary is transmitted,
         // never raw log lines. `to_json` from summary.rs handles this.
-        let summary_json = to_json(summary)?;
+        let summary_json = serde_json::to_string(summary)?;
 
         let prompt = format!(
             "You are a senior engineer triaging a production incident.\n\

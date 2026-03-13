@@ -3,7 +3,6 @@ mod ai;
 mod parser;
 pub mod server;
 mod store;
-mod summary;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -20,7 +19,6 @@ use parser::ai_infer::AiInferredParser;
 use parser::apache::ApacheParser;
 // Import our Parser trait so `.parse()` is in scope on both parser types.
 use parser::Parser;
-use summary::to_json;
 
 /// CLI configuration. Clap derives argument parsing from the struct fields.
 #[derive(ClapParser)]
@@ -178,7 +176,7 @@ async fn run_analysis(file_path: &str) -> Result<()> {
 
     let out = aggregate(records);
     let summary = out.summary;
-    let summary_json = to_json(&summary)?;
+    let summary_json = serde_json::to_string(&summary)?;
 
     println!("{}", format!("Analysing {} log records…", summary.total).bold());
     println!("{}", format!("  Error rate : {:.1}%", summary.error_rate * 100.0).dimmed());
