@@ -1,6 +1,4 @@
 use std::convert::Infallible;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -18,11 +16,9 @@ use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
-use crate::aggregator::{aggregate, AggregatorOutput, LogSummary};
+use crate::aggregator::{AggregatorOutput, LogSummary};
 use crate::ai::{AnalysisEngine, AnalysisResult, Message};
-use crate::parser::ai_infer::AiInferredParser;
-use crate::parser::apache::ApacheParser;
-use crate::parser::Parser;
+use crate::pipeline;
 use crate::store::{ResultStore, StoredResult};
 
 // ---------------------------------------------------------------------------
@@ -256,77 +252,14 @@ async fn parse_file_to_aggregator_output(
     path: &str,
     tx: &mpsc::Sender<Event>,
 ) -> Result<AggregatorOutput> {
-    macro_rules! send {
-        ($evt:expr) => { let _ = tx.send($evt).await; };
-    }
-
-    let file = File::open(path)?;
-    let lines: Vec<String> = BufReader::new(file)
-        .lines()
-        .collect::<std::io::Result<Vec<_>>>()?;
-
-    // Stage 2 — detecting
-    send!(progress("detecting", "Sampling lines for format detection"));
-
-    let sample: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .take(20)
-        .map(String::as_str)
-        .collect();
-
-    if sample.is_empty() {
-        return Err(anyhow::anyhow!("No non-empty lines found in {:?}", path));
-    }
-
-    let apache_parser = ApacheParser::new()?;
-    let tier2 = &sample[..sample.len().min(5)];
-    let hits = tier2.iter().filter(|l| apache_parser.parse(l).is_ok()).count();
-    let use_apache = hits * 2 >= tier2.len();
-
-    // Stage 3 — emit format detection result.
-    // Resolve the inferred parser (if needed) while holding only Send-safe
-    // concrete types. Box<dyn Parser> is not Send so must not be held across
-    // any await point; create it only inside the synchronous record-collection
-    // block below.
-    let inferred_parser: Option<AiInferredParser> = if use_apache {
-        send!(progress("format_known", "Apache access log detected"));
-        None
-    } else {
-        // Send a holding message while we check the cache / call the LLM.
-        send!(progress("detecting", "Checking schema cache for unknown format"));
-        let (parser, cache_hit) = AiInferredParser::new(&sample).await?;
-        if cache_hit {
-            send!(progress("format_cached", "Schema loaded from cache"));
-        } else {
-            send!(progress("format_unknown", "Schema inferred from LLM and cached"));
-        }
-        Some(parser)
-    };
-
-    // Stage 5 — parsing
-    let n = lines.iter().filter(|l| !l.trim().is_empty()).count();
-    send!(progress("parsing", format!("Parsing {n} log records")));
-
-    // Collect records synchronously — no await inside this block so
-    // Box<dyn Parser> does not need to be Send.
-    let records = {
-        let parser: Box<dyn Parser> = match inferred_parser {
-            Some(p) => Box::new(p),
-            None => Box::new(apache_parser),
-        };
-        lines
-            .iter()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| parser.parse(l).ok())
-            .collect::<Vec<_>>()
-        // parser dropped here, before any further await
-    };
-
-    // Stage 6 — aggregating
-    send!(progress("aggregating", "Aggregating statistics"));
-
-    Ok(aggregate(records))
+    // Forward each pipeline stage as an SSE progress event.
+    // `try_send` is sync and non-blocking; with channel capacity 16 and at
+    // most ~6 progress events it will not fail in practice.
+    let (out, _skipped) = pipeline::parse_and_aggregate(path, |stage, msg| {
+        let _ = tx.try_send(progress(stage, msg));
+    })
+    .await?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
