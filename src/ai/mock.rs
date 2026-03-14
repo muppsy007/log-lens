@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::{AnalysisEngine, AnalysisResult, Issue, Message};
+use super::{AnalysisEngine, AnalysisResult, Issue, Message, Role, Severity};
 use crate::aggregator::LogSummary;
 
 /// A test double for `AnalysisEngine` that returns canned responses.
@@ -20,7 +20,7 @@ impl AnalysisEngine for MockEngine {
         Ok(AnalysisResult {
             issues: vec![
                 Issue {
-                    severity: "critical".to_string(),
+                    severity: Severity::Critical,
                     title: "Mock critical issue".to_string(),
                     explanation: format!(
                         "Mock analysis: processed {} log records with elevated error rate.",
@@ -31,7 +31,7 @@ impl AnalysisEngine for MockEngine {
                     evidence: vec![],
                 },
                 Issue {
-                    severity: "warning".to_string(),
+                    severity: Severity::Warning,
                     title: "Mock warning issue".to_string(),
                     explanation: "Some paths returned 4xx responses.".to_string(),
                     action: "Review client request patterns.".to_string(),
@@ -83,8 +83,8 @@ mod tests {
         assert!(!result.issues.is_empty(), "must return at least one issue");
         // The critical issue explanation interpolates the total count.
         assert!(result.issues[0].explanation.contains("42"));
-        assert_eq!(result.issues[0].severity, "critical");
-        assert_eq!(result.issues[1].severity, "warning");
+        assert_eq!(result.issues[0].severity, Severity::Critical);
+        assert_eq!(result.issues[1].severity, Severity::Warning);
         assert!(result.raw.is_none());
     }
 
@@ -92,7 +92,7 @@ mod tests {
     async fn chat_returns_canned_string() {
         let engine = MockEngine;
         let history = vec![Message {
-            role: "user".to_string(),
+            role: Role::User,
             content: "What is the error rate?".to_string(),
         }];
 
