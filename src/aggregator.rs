@@ -8,13 +8,10 @@ use crate::parser::LogRecord;
 /// Sample log lines associated with a particular error pattern.
 /// Used to attach representative evidence to triage issues without ever
 /// sending raw lines to the LLM (the join happens post-analysis).
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ErrorEvidence {
     /// The error path (or message prefix) used as the grouping key.
     pub pattern: String,
-    /// Total number of error occurrences for this pattern.
-    pub count: u32,
     /// Up to 10 raw log lines that matched this pattern.
     pub sample_lines: Vec<String>,
 }
@@ -340,7 +337,7 @@ pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
         .iter()
         .map(|detail| {
             let sample_lines = error_path_samples.remove(&detail.message).unwrap_or_default();
-            ErrorEvidence { pattern: detail.message.clone(), count: detail.count, sample_lines }
+            ErrorEvidence { pattern: detail.message.clone(), sample_lines }
         })
         .collect();
 
@@ -349,7 +346,6 @@ pub fn aggregate(records: Vec<LogRecord>) -> AggregatorOutput {
         let sample_lines = ip_samples.remove(&suspicious.ip).unwrap_or_default();
         evidence.push(ErrorEvidence {
             pattern: suspicious.ip.clone(),
-            count: suspicious.request_count,
             sample_lines,
         });
     }

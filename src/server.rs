@@ -44,8 +44,6 @@ struct SummaryQuery {
 struct ChatRequest {
     question: String,
     history: Vec<Message>,
-    #[allow(dead_code)]
-    summary: LogSummary,
 }
 
 #[derive(Serialize)]
