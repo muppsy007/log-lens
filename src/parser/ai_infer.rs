@@ -75,7 +75,7 @@ impl AiInferredParser {
         let shape = structural_shape(sample_lines);
         let cache_key = sha256_hex(&shape);
 
-        let cache = load_cache()?;
+        let mut cache = load_cache()?;
 
         let client = reqwest::Client::new();
 
@@ -83,9 +83,8 @@ impl AiInferredParser {
             (cached.clone(), true)
         } else {
             let strategy = infer_strategy_from_llm(sample_lines, &client).await?;
-            let mut fresh_cache = load_cache()?;
-            fresh_cache.insert(cache_key, strategy.clone());
-            save_cache(&fresh_cache)?;
+            cache.insert(cache_key, strategy.clone());
+            save_cache(&cache)?;
             (strategy, false)
         };
 
