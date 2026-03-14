@@ -157,9 +157,6 @@ async fn summary_handler(
             };
         }
 
-        // Stage 1 — reading
-        send!(progress("reading", format!("Reading log file: {}", params.file)));
-
         let out = match parse_file_to_aggregator_output(&params.file, &tx).await {
             Ok(o) => o,
             Err(e) => {
@@ -170,7 +167,7 @@ async fn summary_handler(
 
         let summary = out.summary;
 
-        // Stage 7 — analysing
+        // Analysing
         send!(progress("analysing", "Sending summary to LLM for analysis"));
 
         let mut analysis = match state.engine.analyse(&summary).await {
@@ -211,7 +208,7 @@ async fn summary_handler(
             eprintln!("[warn] store.save failed: {e}");
         }
 
-        // Stage 8 — complete
+        // Complete
         send!(complete_event(&summary, &analysis));
         // tx dropped here → stream closes
     });
