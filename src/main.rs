@@ -52,19 +52,7 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn run_server() -> Result<()> {
-    let engine: Box<dyn AnalysisEngine> = match AnthropicEngine::new() {
-        Ok(e) => Box::new(e),
-        Err(_) => {
-            eprintln!(
-                "{}",
-                "Error: ANTHROPIC_API_KEY is not set.\n\
-                 Export it and try again:\n\
-                 \n  export ANTHROPIC_API_KEY=sk-ant-..."
-                    .red()
-            );
-            std::process::exit(1);
-        }
-    };
+    let engine: Box<dyn AnalysisEngine> = Box::new(AnthropicEngine::new()?);
 
     // Read host/port from environment variables with sensible defaults.
     // Using env vars (rather than CLI flags) matches the twelve-factor app
@@ -99,8 +87,7 @@ async fn run_analysis(file_path: &str) -> Result<()> {
     }
 
     if out.summary.total == 0 {
-        eprintln!("{}", "No valid log records found — check the file format.".red());
-        std::process::exit(1);
+        return Err(anyhow::anyhow!("No valid log records found — check the file format."));
     }
 
     let summary = out.summary;
@@ -111,23 +98,7 @@ async fn run_analysis(file_path: &str) -> Result<()> {
     println!("{}", format!("  Summary    : {summary_json}").dimmed());
     println!();
 
-    // -----------------------------------------------------------------------
-    // 5. AI analysis
-    // -----------------------------------------------------------------------
-
-    let engine: Box<dyn AnalysisEngine> = match AnthropicEngine::new() {
-        Ok(e) => Box::new(e),
-        Err(_) => {
-            eprintln!(
-                "{}",
-                "Error: ANTHROPIC_API_KEY is not set.\n\
-                 Export it and try again:\n\
-                 \n  export ANTHROPIC_API_KEY=sk-ant-..."
-                    .red()
-            );
-            std::process::exit(1);
-        }
-    };
+    let engine: Box<dyn AnalysisEngine> = Box::new(AnthropicEngine::new()?);
 
     // Call through the trait object — main.rs never references AnthropicEngine
     // methods directly; everything goes through the AnalysisEngine trait.
