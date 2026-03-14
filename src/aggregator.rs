@@ -71,6 +71,11 @@ pub struct LogSummary {
     /// server-side failures rather than normal 404/401 traffic.
     pub error_rate: f64,
     /// Count of records grouped by HTTP status code.
+    ///
+    /// Stored as `u16` keys so comparisons like `status >= 500` work directly
+    /// without parsing. JSON requires object keys to be strings, so
+    /// `serde_with::DisplayFromStr` serialises each `u16` to its decimal string
+    /// ("200", "404") on the way out and parses it back on the way in.
     #[serde_as(as = "HashMap<DisplayFromStr, _>")]
     pub status_counts: HashMap<u16, u64>,
     /// Top 20 errors by frequency, with structured metadata where available.
