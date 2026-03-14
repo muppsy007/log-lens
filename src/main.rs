@@ -2,7 +2,7 @@ mod aggregator;
 mod ai;
 mod parser;
 mod pipeline;
-pub mod server;
+mod server;
 mod store;
 
 use anyhow::Result;
