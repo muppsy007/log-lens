@@ -68,8 +68,6 @@ where
     let n = lines.iter().filter(|l| !l.trim().is_empty()).count();
     on_progress("parsing", &format!("Parsing {n} log records"));
 
-    // Collect records synchronously — no `.await` inside this block so
-    // `Box<dyn Parser>` does not need to be `Send`.
     let (records, skipped) = {
         let parser: Box<dyn Parser> = match inferred_parser {
             Some(p) => Box::new(p),
@@ -84,7 +82,6 @@ where
             }
         }
         (ok, skipped)
-        // parser dropped here, before any further await
     };
 
     on_progress("aggregating", "Aggregating statistics");
