@@ -8,20 +8,21 @@ use serde::{Deserialize, Serialize};
 use super::{AnalysisEngine, AnalysisResult, Message};
 use crate::aggregator::LogSummary;
 
-/// Model used for all API calls. Defined as a constant so it appears in one
-/// place and can be updated without hunting through method bodies.
-const MODEL: &str = "claude-sonnet-4-20250514";
+/// Model used for all Anthropic API calls. Defined once here and shared with
+/// other modules (e.g. `parser::ai_infer`) via `pub(crate)` so there is a
+/// single place to update when the model version changes.
+pub(crate) const MODEL: &str = "claude-sonnet-4-20250514";
 
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
+pub(crate) const API_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// Anthropic requires this header on every request to pin the API contract.
 /// Without it the request is rejected, so it is a constant rather than a magic string.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Maximum tokens the model may produce in a single response.
 /// 1024 is enough for a structured log analysis or a conversational reply
 /// without risking runaway generation costs.
-const MAX_TOKENS: u32 = 1024;
+pub(crate) const MAX_TOKENS: u32 = 1024;
 
 /// Calls the Anthropic Messages API using `reqwest`.
 ///

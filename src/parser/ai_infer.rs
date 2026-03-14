@@ -10,11 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{InferredRecord, LogRecord, Parser};
-
-const MODEL: &str = "claude-sonnet-4-20250514";
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
-const MAX_TOKENS: u32 = 1024;
+use crate::ai::anthropic::{API_URL, ANTHROPIC_VERSION, MAX_TOKENS, MODEL};
 
 // Static regex patterns used to compute structural shape.
 static RE_TS_APACHE: LazyLock<Regex> = LazyLock::new(|| {
@@ -81,10 +77,12 @@ impl AiInferredParser {
 
         let cache = load_cache()?;
 
+        let client = reqwest::Client::new();
+
         let (strategy, cache_hit) = if let Some(cached) = cache.get(&cache_key) {
             (cached.clone(), true)
         } else {
-            let strategy = infer_strategy_from_llm(sample_lines).await?;
+            let strategy = infer_strategy_from_llm(sample_lines, &client).await?;
             let mut fresh_cache = load_cache()?;
             fresh_cache.insert(cache_key, strategy.clone());
             save_cache(&fresh_cache)?;
@@ -231,7 +229,10 @@ fn save_cache(cache: &HashMap<String, ParseStrategy>) -> Result<()> {
 // LLM call
 // ---------------------------------------------------------------------------
 
-async fn infer_strategy_from_llm(sample_lines: &[&str]) -> Result<ParseStrategy> {
+async fn infer_strategy_from_llm(
+    sample_lines: &[&str],
+    client: &reqwest::Client,
+) -> Result<ParseStrategy> {
     let api_key = env::var("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not set"))?;
 
@@ -250,8 +251,6 @@ async fn infer_strategy_from_llm(sample_lines: &[&str]) -> Result<ParseStrategy>
          Sample lines:\n\
          {sample_text}"
     );
-
-    let client = reqwest::Client::new();
 
     let body = serde_json::json!({
         "model": MODEL,
