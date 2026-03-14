@@ -67,6 +67,6 @@ pub struct InferredRecord {
 ///
 /// Taking `&str` (not `String`) avoids a heap allocation per line — callers
 /// typically hold the line in a read buffer and we only borrow it during parsing.
-pub trait Parser {
+pub trait Parser: Send {
     fn parse(&self, line: &str) -> Result<LogRecord>;
 }
