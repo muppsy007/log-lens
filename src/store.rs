@@ -150,3 +150,105 @@ fn parse_timestamp(s: String) -> Result<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| anyhow!("Invalid timestamp {s:?}: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::aggregator::LogSummary;
+    use crate::ai::{AnalysisResult, Issue, Severity};
+
+    fn stub_summary() -> LogSummary {
+        let mut status_counts = HashMap::new();
+        status_counts.insert(200u16, 10u64);
+        LogSummary {
+            total: 10,
+            error_rate: 0.0,
+            status_counts,
+            top_errors: vec![],
+            top_slow_paths: vec![],
+            suspicious_ips: vec![],
+        }
+    }
+
+    fn stub_analysis() -> AnalysisResult {
+        AnalysisResult {
+            issues: vec![Issue {
+                severity: Severity::Info,
+                title: "test issue".to_string(),
+                explanation: "test explanation".to_string(),
+                action: "no action needed".to_string(),
+                evidence_indices: vec![],
+                evidence: vec![],
+            }],
+            raw: None,
+        }
+    }
+
+    async fn mem_store() -> ResultStore {
+        ResultStore::new("sqlite::memory:").await.expect("in-memory store must succeed")
+    }
+
+    #[tokio::test]
+    async fn save_and_get_round_trip() {
+        let store = mem_store().await;
+        let id = store
+            .save("test.log", &stub_summary(), &stub_analysis())
+            .await
+            .expect("save must succeed");
+
+        let detail = store
+            .get(id)
+            .await
+            .expect("get must succeed")
+            .expect("row must exist after save");
+
+        assert_eq!(detail.id, id);
+        assert_eq!(detail.filename, "test.log");
+        assert_eq!(detail.summary.total, 10);
+        assert_eq!(detail.analysis.issues[0].title, "test issue");
+    }
+
+    #[tokio::test]
+    async fn get_missing_id_returns_none() {
+        let store = mem_store().await;
+        let result = store.get(9999).await.expect("get must not error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_returns_newest_first() {
+        let store = mem_store().await;
+        let id1 = store
+            .save("first.log", &stub_summary(), &stub_analysis())
+            .await
+            .unwrap();
+        let id2 = store
+            .save("second.log", &stub_summary(), &stub_analysis())
+            .await
+            .unwrap();
+
+        let rows = store.list().await.expect("list must succeed");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, id2, "newest must be first");
+        assert_eq!(rows[1].id, id1);
+        assert_eq!(rows[0].filename, "second.log");
+    }
+
+    #[test]
+    fn parse_timestamp_valid_rfc3339() {
+        use chrono::Datelike;
+        let dt = parse_timestamp("2026-03-07T09:12:03+00:00".to_string())
+            .expect("valid RFC3339 must parse");
+        assert_eq!(dt.year(), 2026);
+        assert_eq!(dt.month(), 3);
+        assert_eq!(dt.day(), 7);
+    }
+
+    #[test]
+    fn parse_timestamp_rejects_garbage() {
+        let dt = parse_timestamp("not a timestamp".to_string());
+        assert!(dt.is_err());
+    }
+}
