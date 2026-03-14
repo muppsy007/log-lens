@@ -67,11 +67,14 @@ pub struct AiInferredParser {
 impl AiInferredParser {
     /// Constructs a parser for the given sample lines.
     ///
-    /// Returns `(parser, cache_hit)`. `cache_hit` is `true` when the strategy
-    /// was loaded from disk with no API call; `false` when the LLM was queried.
-    /// Callers use the flag to emit an accurate progress message rather than
-    /// guessing before the call whether the cache will hit.
-    pub async fn new(sample_lines: &[&str]) -> Result<(Self, bool)> {
+    /// `on_progress` is called with `(stage, message)` to report whether the
+    /// strategy was loaded from cache or inferred via the LLM. The cache
+    /// behaviour is an implementation detail — callers receive a ready parser,
+    /// not a flag to act on.
+    pub async fn new<F>(sample_lines: &[&str], on_progress: &mut F) -> Result<Self>
+    where
+        F: FnMut(&str, &str),
+    {
         let shape = structural_shape(sample_lines);
         let cache_key = sha256_hex(&shape);
 
@@ -79,13 +82,17 @@ impl AiInferredParser {
 
         let client = reqwest::Client::new();
 
-        let (strategy, cache_hit) = if let Some(cached) = cache.get(&cache_key) {
-            (cached.clone(), true)
+        on_progress("detecting", "Checking schema cache for unknown format");
+
+        let strategy = if let Some(cached) = cache.get(&cache_key) {
+            on_progress("format_cached", "Format not recognised — using cached schema…");
+            cached.clone()
         } else {
             let strategy = infer_strategy_from_llm(sample_lines, &client).await?;
             cache.insert(cache_key, strategy.clone());
             save_cache(&cache)?;
-            (strategy, false)
+            on_progress("format_unknown", "Format not recognised — schema inferred and cached…");
+            strategy
         };
 
         let re = Regex::new(&strategy.outer_regex).map_err(|e| {
@@ -95,11 +102,11 @@ impl AiInferredParser {
             )
         })?;
 
-        Ok((Self {
+        Ok(Self {
             re,
             context_field: strategy.context_field,
             parse_context_as_json: strategy.parse_context_as_json,
-        }, cache_hit))
+        })
     }
 }
 
@@ -413,7 +420,7 @@ mod tests {
             "2026-03-07T09:12:03 ERROR 127.0.0.1 404",
             "2026-03-07T09:13:00 INFO  10.0.0.1  200",
         ];
-        let (parser, _cache_hit) = AiInferredParser::new(lines)
+        let parser = AiInferredParser::new(lines, &mut |_, _| {})
             .await
             .expect("parser construction must succeed");
 

@@ -62,14 +62,7 @@ where
         on_progress("format_known", "Detected format: Apache Combined Log");
         None
     } else {
-        on_progress("detecting", "Checking schema cache for unknown format");
-        let (parser, cache_hit) = AiInferredParser::new(&sample).await?;
-        if cache_hit {
-            on_progress("format_cached", "Format not recognised — using cached schema\u{2026}");
-        } else {
-            on_progress("format_unknown", "Format not recognised — schema inferred and cached\u{2026}");
-        }
-        Some(parser)
+        Some(AiInferredParser::new(&sample, &mut on_progress).await?)
     };
 
     let n = lines.iter().filter(|l| !l.trim().is_empty()).count();
