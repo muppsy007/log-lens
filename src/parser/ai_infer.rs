@@ -166,11 +166,16 @@ pub fn structural_shape(lines: &[&str]) -> String {
 }
 
 fn shape_line(line: &str) -> String {
-    let s = RE_TS_APACHE.replace_all(line, "\x01");
+    // Substitution is done in two phases to avoid stomping.
+    // If we replaced timestamps with "T" directly, the word regex would then
+    // match that "T" and overwrite it with "W". Instead, phase 1 replaces each
+    // token class with a control character that no regex will ever match, then
+    // phase 2 swaps those sentinels for the readable placeholder letters.
+    let s = RE_TS_APACHE.replace_all(line, "\x01"); // \x01 = timestamp sentinel
     let s = RE_TS_ISO.replace_all(&s, "\x01");
     let s = RE_TS_SYSLOG.replace_all(&s, "\x01");
-    let s = RE_NUMBER.replace_all(&s, "\x02");
-    let s = RE_WORD.replace_all(&s, "\x03");
+    let s = RE_NUMBER.replace_all(&s, "\x02");      // \x02 = number sentinel
+    let s = RE_WORD.replace_all(&s, "\x03");        // \x03 = word sentinel
     s.to_string()
         .replace('\x01', "T")
         .replace('\x02', "N")
