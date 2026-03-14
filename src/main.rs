@@ -114,7 +114,7 @@ async fn run_analysis(file_path: &str) -> Result<()> {
         for issue in &result.issues {
             println!(
                 "[{}] {} — {}  → {}",
-                issue.severity.to_uppercase(),
+                issue.severity,
                 issue.title,
                 issue.explanation,
                 issue.action

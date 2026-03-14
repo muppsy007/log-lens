@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::{AnalysisEngine, AnalysisResult, Message};
+use super::{AnalysisEngine, AnalysisResult, Message, Role};
 use crate::aggregator::LogSummary;
 
 /// Model used for all Anthropic API calls. Defined once here and shared with
@@ -128,7 +128,7 @@ impl AnalysisEngine for AnthropicEngine {
         );
 
         let messages = vec![ApiMessage {
-            role: "user".to_string(),
+            role: Role::User,
             content: prompt,
         }];
 
@@ -159,7 +159,7 @@ impl AnalysisEngine for AnthropicEngine {
 
         // Append the current question as the final user turn.
         messages.push(ApiMessage {
-            role: "user".to_string(),
+            role: Role::User,
             content: question.to_string(),
         });
 
@@ -181,7 +181,7 @@ struct ApiRequest {
 
 #[derive(Serialize)]
 struct ApiMessage {
-    role: String,
+    role: Role,
     content: String,
 }
 

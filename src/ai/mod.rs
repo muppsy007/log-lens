@@ -8,11 +8,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::aggregator::LogSummary;
 
+/// Severity of a triage issue. Serialises to/from lowercase JSON strings
+/// ("critical", "warning", "info") matching the LLM response contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Critical,
+    Warning,
+    Info,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Severity::Critical => write!(f, "CRITICAL"),
+            Severity::Warning => write!(f, "WARNING"),
+            Severity::Info => write!(f, "INFO"),
+        }
+    }
+}
+
+/// Role of a message turn in a conversation.
+/// Serialises to/from lowercase JSON strings ("user", "assistant") following
+/// the Anthropic Messages API wire format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+}
+
 /// A single triage issue identified by the AI layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issue {
-    /// Severity level: "critical" | "warning" | "info"
-    pub severity: String,
+    pub severity: Severity,
     /// One-line label, e.g. "High 5xx error rate"
     pub title: String,
     /// 1–2 sentences describing what is wrong
@@ -44,14 +73,11 @@ pub struct AnalysisResult {
 
 /// A single turn in a chat conversation.
 ///
-/// `role` follows the OpenAI / Anthropic convention ("user" | "assistant")
-/// so the struct maps directly to API request bodies without transformation.
-/// `Clone` is derived because the server will need to append to and pass
-/// history slices without consuming the stored vec.
+/// `Clone` is derived because the server appends to and passes history slices
+/// without consuming the stored vec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
-    /// Either "user" or "assistant".
-    pub role: String,
+    pub role: Role,
     pub content: String,
 }
 
